@@ -29,6 +29,23 @@
   }
   function stats(T) { var n = T.length, s = 0, ss = 0, i; for (i = 0; i < n; i++) { s += T[i]; ss += T[i] * T[i]; } var m = s / n; return { mean: m, norm: Math.sqrt(Math.max(ss - n * m * m, 1e-9)) }; }
 
+  /* How fast the kart is turning, from what the phone measures.
+       w    the phone's rotation rate about its own x, y, z (deg/s); z is the axis through the screen
+       up   the direction of "up" in the phone's own axes (unit length)
+     The plain answer is the part of the rotation about the vertical (w . up). But a phone on the
+     steering wheel also turns WITH the wheel, about the steering column, and the column leans, so part
+     of every movement of the wheel would be read as the kart turning. A phone lying in the plane of the
+     wheel has the column along its own z axis, so that rotation is all in w[2]: leave w[2] out and
+     rebuild the turn rate from the rotation about the two axes in the screen. This is exact for a
+     phone square on the wheel and equally exact for a phone on a fixed mount. It cannot work when the
+     screen faces straight up (nothing of "up" lies in the screen), so the plain answer takes over there. */
+  function turnRate(w, up) {
+    var plain = w[0] * up[0] + w[1] * up[1] + w[2] * up[2], h2 = up[0] * up[0] + up[1] * up[1];
+    if (h2 <= 0.12) return plain;
+    var k = Math.min(1, (h2 - 0.12) / 0.18);
+    return plain + k * ((w[0] * up[0] + w[1] * up[1]) / h2 - plain);
+  }
+
   /* ---------------------------------------------------------------- lap detector */
   function LapDetector(opts) {
     opts = opts || {};
@@ -50,8 +67,12 @@
   /* Feed raw samples: t in seconds from the start, turn rate in deg/s (any rate >= 20 Hz). */
   LapDetector.prototype.push = function (t, yaw) {
     // average all raw samples falling in each 1/FS slot (a simple, robust low-pass)
+    // A short silence repeats the last value. A long one (the app was in the background, the screen was
+    // locked) is filled with "not turning": repeating a cornering value for half a minute would add
+    // whole turns of heading that never happened.
+    var silent = Math.floor(t * this.fs) - this._next > Math.round(0.5 * this.fs);
     while (t >= (this._next + 1) / this.fs) {
-      var v = this._n ? this._acc / this._n : (this.y.length ? this.y[this.y.length - 1] : 0);
+      var v = this._n ? this._acc / this._n : (silent ? 0 : (this.y.length ? this.y[this.y.length - 1] : 0));
       this.y.push(v); this._acc = 0; this._n = 0; this._next++;
     }
     if (isFinite(yaw)) { this._acc += yaw; this._n++; }
@@ -303,7 +324,7 @@
   LapDetector.prototype.update = function (final) {
     var n = this.y.length, fs = this.fs;
     if (this.period === null) {
-      if (n < 2.2 * this.minLap * fs || (!final && n - this._lastTry < 3 * fs)) return false;
+      if (n < 2.2 * this.minLap * fs || (!final && n - this._lastTry < Math.max(3 * fs, 0.02 * n))) return false;
       this._lastTry = n;
       return this._lock(this._smooth(), !!final);
     }
@@ -363,24 +384,31 @@
     var n = A.length, m = B.length;
     if (n < 4 || m < 4) return null;
     var w = Math.max(Math.round((band || 0.12) * Math.max(n, m)), Math.abs(n - m) + 4);
-    var INF = 1e30, D = new Float64Array((n + 1) * (m + 1)).fill(INF), i, j, W = m + 1;
-    D[0] = 0;
+    // Only a band of the table around the diagonal is ever used, so only that band is stored: row i
+    // holds columns base[i] .. base[i] + BW - 1. Outside the band the cost is "impossible".
+    var INF = 1e30, BW = 2 * w + 3, i, j;
+    if ((n + 1) * BW > 1.2e7) return null;                 // too long a lap for a phone's memory: no breakdown rather than a crash
+    var D = new Float64Array((n + 1) * BW).fill(INF), base = new Int32Array(n + 1);
+    for (i = 0; i <= n; i++) base[i] = Math.round(i * m / n) - w - 1;
+    function get(r, col) { var q = col - base[r]; return q < 0 || q >= BW ? INF : D[r * BW + q]; }
+    D[0 * BW + (0 - base[0])] = 0;
     // scale so the cost does not depend on how hard the kart turns
     var sc = 0; for (i = 0; i < n; i++) sc += Math.abs(A[i]); sc = sc / n || 1;
     for (i = 1; i <= n; i++) {
       var c = Math.round(i * m / n), jl = Math.max(1, c - w), jh = Math.min(m, c + w);
       for (j = jl; j <= jh; j++) {
-        var d = Math.abs(A[i - 1] - B[j - 1]) / sc, a = D[(i - 1) * W + j - 1], b = D[(i - 1) * W + j] + PEN, e = D[i * W + j - 1] + PEN;
-        D[i * W + j] = d + Math.min(a, b, e);
+        var d = Math.abs(A[i - 1] - B[j - 1]) / sc, a = get(i - 1, j - 1), b = get(i - 1, j) + PEN, e = get(i, j - 1) + PEN;
+        D[i * BW + (j - base[i])] = d + Math.min(a, b, e);
       }
     }
-    if (D[n * W + m] >= INF) return null;
+    var total = get(n, m);
+    if (total >= INF) return null;
     // walk back; several B samples can match one A sample: keep their mean
     var sum = new Float64Array(n), cnt = new Float64Array(n);
     i = n; j = m;
     while (i > 0 && j > 0) {
       sum[i - 1] += j - 1; cnt[i - 1]++;
-      var p = D[(i - 1) * W + j - 1], q = D[(i - 1) * W + j], r = D[i * W + j - 1];
+      var p = get(i - 1, j - 1), q = get(i - 1, j), r = get(i, j - 1);
       if (p <= q && p <= r) { i--; j--; } else if (q <= r) i--; else j--;
     }
     var map = new Float32Array(n);
@@ -390,7 +418,7 @@
     var sm = new Float32Array(n), k = 3 * UP;
     for (i = 0; i < n; i++) { var s2 = 0, c2 = 0; for (j = Math.max(0, i - k); j <= Math.min(n - 1, i + k); j++) { s2 += map[j]; c2++; } sm[i] = s2 / c2; }
     sm[0] = 0; sm[n - 1] = m - 1;
-    return { map: sm, cost: D[n * W + m] / (n + m) };
+    return { map: sm, cost: total / (n + m) };
   }
 
   /* Corners of a lap from its turn-rate signal: stretches of sustained turning, each with the piece
@@ -531,7 +559,7 @@
   /* The reference lap for the tracker: the smoothed signal from its exact start, one value per working sample. */
   function referenceLap(sm, start, end, fs) { fs = fs || FS; var n = Math.max(2, Math.round((end - start) * fs)), out = new Float32Array(n); for (var i = 0; i < n; i++) out[i] = valueAt(sm, start + i / fs, fs); return out; }
 
-  var api = { FS: FS, LapDetector: LapDetector, lapsFromMarks: lapsFromMarks, lapSignal: lapSignal, alignLaps: alignLaps,
+  var api = { FS: FS, turnRate: turnRate, LapDetector: LapDetector, lapsFromMarks: lapsFromMarks, lapSignal: lapSignal, alignLaps: alignLaps,
               findCorners: findCorners, cornerTimes: cornerTimes, median: median, LiveTracker: LiveTracker, lapSignalFine: lapSignalFine, valueAt: valueAt, referenceLap: referenceLap };
   if (typeof module !== "undefined" && module.exports) module.exports = api; else root.KartCore = api;
 })(typeof self !== "undefined" ? self : this);

@@ -1,7 +1,7 @@
 /* app.js -- Apex Trace Kart 2: screens, sensors and storage. The measuring is in core.js. */
 (function () {
   "use strict";
-  const K = window.KartCore, VERSION = "2.0.0", G0 = 9.80665;
+  const K = window.KartCore, VERSION = "2.0.1", G0 = 9.80665;
   const $ = (s, r) => (r || document).querySelector(s), $$ = (s, r) => Array.from((r || document).querySelectorAll(s));
   const esc = s => String(s === null || s === undefined ? "" : s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
   const app = $("#app");
@@ -68,7 +68,8 @@
         const rq = indexedDB.open("apex-trace-kart", 1);
         rq.onupgradeneeded = () => { rq.result.createObjectStore("sessions", { keyPath: "id" }); rq.result.createObjectStore("data", { keyPath: "id" }); };
         rq.onsuccess = () => resolve(rq.result);
-        rq.onerror = () => resolve(null);
+        rq.onerror = rq.onblocked = () => resolve(null);
+        setTimeout(() => resolve(null), 5000);          // storage that never answers: carry on in memory
       } catch (e) { resolve(null); }
     });
     return dbp;
@@ -77,14 +78,18 @@
     const d = await db();
     if (!d) return fn(null);
     return new Promise((resolve, reject) => {
+      // a write that is refused (storage full) ends in "abort", not "error"; and nothing here may wait for ever
+      const timer = setTimeout(() => reject(new Error("storage did not answer")), 10000);
       const t = d.transaction(store, mode), st = t.objectStore(store), rq = fn(st);
-      t.oncomplete = () => resolve(rq && rq.result); t.onerror = () => reject(t.error);
+      t.oncomplete = () => { clearTimeout(timer); resolve(rq && rq.result); };
+      t.onerror = t.onabort = () => { clearTimeout(timer); reject(t.error || new Error("storage refused the write")); };
     });
   }
   const Store = {
-    async put(store, val) { mem[store].set(val.id, val); try { await tx(store, "readwrite", st => st && st.put(val)); } catch (e) { toast("This session could not be saved on the phone (storage full?)."); } },
-    async get(store, id) { try { const v = await tx(store, "readonly", st => st && st.get(id)); if (v) return v; } catch (e) { /* fall through */ } return mem[store].get(id) || null; },
-    async all() { let out = null; try { out = await tx("sessions", "readonly", st => st && st.getAll()); } catch (e) { out = null; } return (out || Array.from(mem.sessions.values())).sort((a, b) => b.started - a.started); },
+    /* true when the phone's storage took it; false when it is only held in memory (lost if the app closes) */
+    async put(store, val) { mem[store].set(val.id, val); try { const d = await db(); if (!d) return false; await tx(store, "readwrite", st => st.put(val)); return true; } catch (e) { return false; } },
+    async get(store, id) { if (mem[store].has(id)) return mem[store].get(id); try { const v = await tx(store, "readonly", st => st && st.get(id)); if (v) return v; } catch (e) { /* fall through */ } return mem[store].get(id) || null; },
+    async all() { let out = null; try { out = await tx("sessions", "readonly", st => st && st.getAll()); } catch (e) { out = null; } const by = new Map((out || []).map(x => [x.id, x])); mem.sessions.forEach((v, k) => by.set(k, v)); return Array.from(by.values()).sort((a, b) => b.started - a.started); },
     async del(id) { mem.sessions.delete(id); mem.data.delete(id); try { await tx("sessions", "readwrite", st => st && st.delete(id)); await tx("data", "readwrite", st => st && st.delete(id)); } catch (e) { /* gone anyway */ } },
   };
 
@@ -104,20 +109,26 @@
   function newSession(source) {
     return { id: "s" + Date.now().toString(36), track: settings.track.trim() || "Unnamed track", started: Date.now(), source, rec: new Rec(), det: new K.LapDetector(),
              marks: [], t: 0, gf: null, gS: 0, gLapMax: 0, gMax: 0, events: 0, hasLin: false, hasGyro: false, audio: { t: [], bins: [] }, lastLapN: 0, sim: null,
-             trk: null, trkRef: null, trkPasses: -1, trkAnchor: 0 };
+             trk: null, trkRef: null, trkPasses: -1, trkAnchor: 0, log: [], gaps: 0, gapTime: 0, errs: 0, wake: "not asked", ending: false };
   }
+  /* What happened during the session, with the time it happened: kept with the session and written into
+     the data file, so that a problem at the track can be understood afterwards. */
+  function note(s, text) { if (s && s.log.length < 300) s.log.push([+(s.t || 0).toFixed(1), String(text).slice(0, 160)]); }
 
   /* ------------------------------------------------------------------ laps and the live figure */
-  function currentLaps(s) { return s.source === "taps" ? K.lapsFromMarks(s.marks) : s.det.laps(); }
-  function lastPass(s) { return s.source === "taps" ? (s.marks.length ? s.marks[s.marks.length - 1] : null) : s.det.lastPass(); }
-  function passCount(s) { return s.source === "taps" ? s.marks.length : s.det.passes.length; }
+  /* Which timing drives the dash right now. With automatic timing, the driver's own taps stand in until
+     the lap has been found (2 to 3 laps on a normal track, minutes on a track that crosses over itself). */
+  function liveSource(s) { return s.source === "taps" || (s.det.state() === "learning" && s.marks.length >= 1) ? "taps" : "auto"; }
+  function currentLaps(s) { return liveSource(s) === "taps" ? K.lapsFromMarks(s.marks) : s.det.laps(); }
+  function lastPass(s) { return liveSource(s) === "taps" ? (s.marks.length ? s.marks[s.marks.length - 1] : null) : s.det.lastPass(); }
+  function passCount(s) { return liveSource(s) === "taps" ? s.marks.length : s.det.passes.length; }
 
   /* Everything the dashboard can show, at this instant. */
   function model(s) {
     const t = s.t, laps = currentLaps(s), ok = laps.filter(l => !l.interrupted), last = laps.length ? laps[laps.length - 1] : null, prev = laps.length > 1 ? laps[laps.length - 2] : null;
     const best = ok.length ? ok.reduce((a, b) => b.time < a.time ? b : a) : null, pass = lastPass(s);
     const m = { t, laps, last, prev, best, timing: pass !== null, lapClock: pass !== null ? t - pass : null, delta: null, pred: null, lapN: laps.length + (pass !== null ? 1 : 0),
-                gS: s.gS, gLapMax: s.gLapMax, left: settings.minutes > 0 ? Math.max(0, settings.minutes * 60 - t) : null, source: s.source, state: s.source === "taps" ? "taps" : s.det.state() };
+                gS: s.gS, gLapMax: s.gLapMax, left: settings.minutes > 0 ? Math.max(0, settings.minutes * 60 - t) : null, source: liveSource(s), standIn: s.source === "auto" && liveSource(s) === "taps", state: s.source === "taps" ? "taps" : s.det.state() };
     // live plus or minus to the best lap: follow the best lap's turn pattern from the last pass
     if (best && pass !== null && s.det.y.length > 20) {
       const fs = K.FS, sm = s.det._smooth(), n = passCount(s);
@@ -173,7 +184,7 @@
         ${n ? `<div class="dtiles" style="grid-template-columns:repeat(${cols},minmax(0,1fr))">${tiles.map((k, i) => `<div class="dtile" data-tile="${k}"><div class="dlabel">${esc(FIELDS[k].label)}</div><div class="dval" data-r="V-${i}"></div></div>`).join("")}</div>` : ""}
       </div>
       ${cfg.gBar ? `<div class="gbar" aria-label="Cornering and braking force"><i data-r="gfill"></i><em data-r="gmark"></em></div>` : ""}
-      ${opts.preview ? "" : `<div class="dfoot"><span class="dstatus" data-r="status"></span><button class="stop" id="stop" type="button"><i id="stopfill"></i><span>Hold to stop</span></button></div><div class="tapmark" id="tapmark"></div>`}
+      ${opts.preview ? "" : `<div class="dfoot"><span class="dstatus" data-r="status"></span><button class="stop" id="stop" type="button">Stop</button></div><div class="tapmark" id="tapmark"></div>`}
     </div>`;
     const ref = {}; $$("[data-r]", host).forEach(e => { ref[e.dataset.r] = e; });
     const cache = {};
@@ -196,93 +207,211 @@
   }
 
   /* ------------------------------------------------------------------ driving */
-  let wake = null, refresh = null, ticks = 0;
-  async function startDrive(sim) {
-    cur = newSession(settings.source);
-    cur.t0 = performance.now();
-    if (sim) {
-      const d = window.KartSim.session({ laps: 9, seed: 1 + Math.floor(Math.random() * 90) });
-      cur.sim = { d, i: 0, speed: sim.speed, t0: performance.now() }; cur.track = "Simulated drive"; cur.demo = true; cur.source = "auto";
-    } else {
-      window.addEventListener("devicemotion", onMotion);
-      startAudio();
-    }
-    try { if ("wakeLock" in navigator) wake = await navigator.wakeLock.request("screen"); } catch (e) { wake = null; }
-    try { await document.documentElement.requestFullscreen({ navigationUI: "hide" }); if (screen.orientation && screen.orientation.lock) await screen.orientation.lock(screen.orientation.type); } catch (e) { /* optional */ }
-    refresh = buildDash(app, settings.dash, {});
-    ticks = 0;
-    const dash = $("#dash"), stop = $("#stop");
-    dash.addEventListener("pointerdown", e => {
-      if (e.target.closest("#stop") || !cur || cur.sim) return;
-      cur.marks.push(cur.t || (performance.now() - cur.t0) / 1000);
-      const m = $("#tapmark"); m.classList.remove("on"); void m.offsetWidth; m.classList.add("on");
-    });
-    let hold = null;
-    const cancel = () => { if (hold) { clearInterval(hold.t); hold = null; $("#stopfill").style.width = "0"; } };
-    stop.addEventListener("pointerdown", e => {
-      e.preventDefault(); cancel();
-      hold = { at: performance.now(), t: setInterval(() => { const f = (performance.now() - hold.at) / 1100; $("#stopfill").style.width = Math.min(100, 100 * f) + "%"; if (f >= 1) { cancel(); endDrive(); } }, 40) };
-    });
-    ["pointerup", "pointerleave", "pointercancel"].forEach(ev => stop.addEventListener(ev, cancel));
-    document.addEventListener("visibilitychange", rewake);
-    cur.loop = setInterval(tick, 100);
-    cur.autosave = setInterval(() => { if (cur && !cur.sim) persist(cur, false); }, 20000);
+  /* Everything here is written so that one thing going wrong cannot take the rest with it: the recording
+     carries on if the lap timing fails, the session is kept if the app is closed or the phone locks, and
+     leaving the dash always takes two deliberate taps. */
+  let wake = null, refresh = null, ticks = 0, starting = false;
+  const MAX_SESSION_S = 90 * 60;                 // a session left running is stopped and saved after this long
+
+  /* Keep the screen on. The phone may refuse (battery saver) or take the lock back; ask again whenever
+     the app comes back to the front. */
+  async function holdScreen() {
+    const s = cur; if (!s || s.ending) return;
+    if (!("wakeLock" in navigator)) { s.wake = "not supported"; return; }
+    try {
+      const w = await navigator.wakeLock.request("screen");
+      if (cur !== s || s.ending) { try { w.release(); } catch (e) { /* gone */ } return; }
+      wake = w; if (s.wake !== "held") note(s, "screen kept on"); s.wake = "held";
+      w.addEventListener("release", () => { if (wake === w) wake = null; if (cur === s && !s.ending) { s.wake = "released"; note(s, "the phone released the screen lock"); if (document.visibilityState === "visible") setTimeout(holdScreen, 400); } });
+    } catch (e) { if (cur === s) { if (s.wake !== "refused") note(s, "screen lock refused (" + (e && e.name) + ")"); s.wake = "refused"; } }
   }
-  async function rewake() { if (cur && document.visibilityState === "visible" && "wakeLock" in navigator) { try { wake = await navigator.wakeLock.request("screen"); } catch (e) { /* optional */ } } }
+  async function goFullscreen() {
+    try {
+      if (!document.fullscreenElement && document.documentElement.requestFullscreen) await document.documentElement.requestFullscreen({ navigationUI: "hide" });
+      if (screen.orientation && screen.orientation.lock) await screen.orientation.lock(screen.orientation.type);
+    } catch (e) { /* optional: the dash works without it */ }
+  }
+
+  /* Leaving the dash. One tap asks, a second tap on a large button confirms. Nothing is held down:
+     a finger does not stay still on a vibrating wheel. The question goes away by itself. */
+  function askStop(how) {
+    const s = cur, dash = $("#dash"); if (!s || s.ending || !dash || $("#ask")) return;
+    note(s, "stop asked (" + how + ")");
+    const el = document.createElement("div"); el.className = "ask"; el.id = "ask"; el.setAttribute("role", "dialog"); el.setAttribute("aria-label", "Stop this session?");
+    el.innerHTML = `<div class="askbox"><p class="askq">Stop this session?</p>
+      <button type="button" class="askyes" id="askyes">Stop and save</button>
+      <button type="button" class="askno" id="askno">Keep driving</button>
+      <p class="asks">Timing is still running. This closes by itself.</p><div class="askbar"><i></i></div></div>`;
+    dash.appendChild(el);
+    const opened = performance.now();
+    const close = why => { clearTimeout(timer); el.remove(); if (why) note(s, why); };
+    const timer = setTimeout(() => close("stop not confirmed"), 8000);
+    // act on the touch itself (no waiting for the finger to lift), but never on the touch that opened this
+    const on = (b, fn) => {
+      const go = e => {
+        e.preventDefault(); e.stopPropagation(); if (performance.now() - opened < 350) return;
+        if (e.type === "pointerdown") swallowClick();
+        fn();
+      };
+      b.addEventListener("pointerdown", go);
+      b.addEventListener("click", e => { if (!e.pointerType) go(e); });           // keyboard (a click made by a touch or a mouse names it)
+    };
+    on($("#askyes"), () => { close(); endDrive("stopped by the driver"); });
+    on($("#askno"), () => close("carried on"));
+  }
+  /* The screen changes while the finger is still down, so when it lifts, its "click" would land on whatever
+     is now underneath (a button of the next page). Swallow that one click. */
+  function swallowClick() {
+    const eat = c => { c.preventDefault(); c.stopImmediatePropagation(); done(); };
+    const done = () => { window.removeEventListener("click", eat, true); clearTimeout(limit); };
+    const off = () => setTimeout(done, 120);
+    const limit = setTimeout(done, 4000);
+    window.addEventListener("click", eat, true);
+    window.addEventListener("pointerup", off, { once: true, capture: true }); window.addEventListener("pointercancel", off, { once: true, capture: true });
+  }
+  function onBack() {
+    // the phone's back button or back swipe: never leaves a running session, it asks like the Stop button
+    if (!cur || cur.ending) return;
+    try { history.pushState({ drive: 1 }, ""); } catch (e) { /* fine */ }
+    askStop("back button");
+  }
+  function onVisibility() {
+    const s = cur; if (!s || s.ending) return;
+    if (document.visibilityState === "hidden") { s.hiddenAt = performance.now(); note(s, "app went to the background"); if (!s.sim) persist(s, false).catch(() => {}); }
+    else { note(s, "app came back after " + (s.hiddenAt ? ((performance.now() - s.hiddenAt) / 1000).toFixed(0) : "?") + " s"); holdScreen(); }
+  }
+  function onPageHide() { const s = cur; if (s && !s.sim && !s.ending) { note(s, "app closed while recording"); persist(s, false).catch(() => {}); } }
+
+  async function startDrive(sim) {
+    if (cur || starting) return;                 // a second tap on "Start" must not start a second session
+    starting = true;
+    try {
+      const s = cur = newSession(settings.source);
+      s.t0 = performance.now();
+      if (sim) {
+        const d = window.KartSim.session({ laps: 9, seed: 1 + Math.floor(Math.random() * 90) });
+        s.sim = { d, i: 0, speed: sim.speed, t0: performance.now() }; s.track = "Simulated drive"; s.demo = true; s.source = "auto";
+      } else {
+        window.addEventListener("devicemotion", onMotion);
+        startAudio();
+        try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {}); } catch (e) { /* optional */ }
+      }
+      refresh = buildDash(app, settings.dash, {});
+      ticks = 0;
+      const dash = $("#dash"), stop = $("#stop");
+      dash.addEventListener("contextmenu", e => e.preventDefault());                // no long-press menu
+      dash.addEventListener("pointerdown", e => {
+        if (e.target.closest("#stop, #ask") || $("#ask") || !cur || cur.sim) return;
+        // a tap anywhere marks the line. Time of the touch itself, not of its handling.
+        const now = performance.now(), ts = e.timeStamp > 0 && Math.abs(e.timeStamp - now) < 2000 ? e.timeStamp : now, t = (ts - cur.t0) / 1000;
+        if (cur.marks.length && t - cur.marks[cur.marks.length - 1] < 2) return;    // a second touch straight after is the same tap
+        cur.marks.push(t);
+        const m = $("#tapmark"); m.classList.remove("on"); void m.offsetWidth; m.classList.add("on");
+      });
+      dash.addEventListener("pointerup", () => { if (cur && !cur.sim && !document.fullscreenElement) goFullscreen(); });   // fullscreen was lost: take it back
+      stop.addEventListener("pointerdown", e => { e.preventDefault(); e.stopPropagation(); askStop("stop button"); });
+      stop.addEventListener("click", e => { if (!e.pointerType) askStop("stop button"); });
+      document.addEventListener("visibilitychange", onVisibility);
+      window.addEventListener("pagehide", onPageHide);
+      window.addEventListener("popstate", onBack);
+      try { history.pushState({ drive: 1 }, ""); } catch (e) { /* fine */ }
+      s.loop = setInterval(tick, 100);
+      s.autosave = setInterval(() => { if (cur === s && !s.sim && !s.ending) persist(s, false).catch(() => {}); }, 15000);
+      note(s, sim ? "simulated drive" : "session started");
+      holdScreen();
+      goFullscreen();
+    } finally { starting = false; }
+  }
 
   function tick() {
-    const s = cur; if (!s || !$("#dash")) return;
+    const s = cur; if (!s || s.ending || !$("#dash")) return;
     if (s.sim) {                                   // feed the simulated kart, faster than real time
       const d = s.sim.d, until = (performance.now() - s.sim.t0) / 1000 * s.sim.speed;
       while (s.sim.i < d.t.length && d.t[s.sim.i] <= until) {
         const i = s.sim.i++;
         sample(d.t[i], [d.lonG[i] * G0, d.latG[i] * G0, 0], [d.lonG[i] * G0, d.latG[i] * G0, G0], [0, 0, d.yaw[i]]);
       }
-      if (s.sim.i >= d.t.length) { endDrive(); return; }
-    } else s.t = (performance.now() - s.t0) / 1000;
+      if (s.sim.i >= d.t.length) { endDrive("simulation finished"); return; }
+    } else {
+      s.t = (performance.now() - s.t0) / 1000;
+      if (s.t > MAX_SESSION_S) { endDrive("stopped after 90 minutes"); return; }
+    }
     ticks++;
-    if (ticks % 5 === 0 && s.source === "auto") s.det.update();
-    const m = model(s);
+    let m = null;
+    try {
+      if (ticks % 5 === 0 && s.source === "auto") { const was = s.det.relearned || 0; s.det.update(); if ((s.det.relearned || 0) !== was) note(s, "lap learnt again"); }
+      m = model(s);
+      if (s.source === "auto" && !s.found && s.det.state() !== "learning") { s.found = true; note(s, "lap found: " + (s.det.period / K.FS).toFixed(1) + " s, by " + s.det.method); }
+    } catch (e) {
+      // the timing failed on this data; the recording is separate and carries on
+      s.errs++; s.errAt = s.t; if (s.errs <= 5) note(s, "timing error: " + (e && e.message));
+      const pass = null;
+      m = { t: s.t, laps: [], last: null, prev: null, best: null, timing: false, lapClock: pass, delta: null, pred: null, lapN: 0, gS: s.gS, gLapMax: s.gLapMax,
+            left: settings.minutes > 0 ? Math.max(0, settings.minutes * 60 - s.t) : null, source: s.source, standIn: false, state: "error" };
+    }
     if (m.laps.length !== s.lastLapN) {
       s.lastLapN = m.laps.length; s.gLapMax = s.gS;
       $$('[data-tile="last"]').forEach(c => { c.classList.remove("flash"); void c.offsetWidth; c.classList.add("flash"); });
     }
     if (m.state === "learning") m.learn = Math.min(0.97, Math.abs(s.det.y.reduce((a, b) => a + b, 0)) / K.FS / 360 / 2.4);
-    if (!s.sim && s.t > 3 && s.events === 0) m.status = "No motion data from this phone";
-    else if (!s.sim && s.t > 3 && !s.hasGyro && s.source === "auto") m.status = "No turn sensor: use “My taps”";
-    else if (m.state === "learning") m.status = s.t < 20 ? "Lap times appear after 2 to 3 laps" : "Finding the lap in the turn pattern";
+    const live = !s.sim;
+    if (m.state === "error" || (s.errAt !== undefined && s.t - s.errAt < 5)) m.status = "Lap timing hit a problem. Still recording.";
+    else if (live && s.t > 3 && s.events === 0) m.status = "No motion data from this phone";
+    else if (live && s.events > 0 && s.t - (s.tS || 0) > 2) m.status = "Motion data has stopped";
+    else if (live && s.t > 3 && !s.hasGyro && s.source === "auto") m.status = "No turn sensor: tap at the line";
+    else if (live && s.t > 2 && s.t < 25 && s.wake !== "held") m.status = "Screen may switch off: battery saver?";
+    else if (m.standIn) m.status = "Timing from your taps while the track is learnt";
+    else if (m.state === "learning") m.status = s.t < 20 ? "Lap times appear after 2 to 3 laps" : s.t < 150 ? "Finding the lap. Tap at the line for times now" : "Lap not found yet. Tap at the line for times";
     else if (m.state === "taps" && !s.marks.length) m.status = "Tap anywhere as you cross the line";
     else m.status = (m.source === "taps" ? "Laps by your taps" : "Automatic laps") + "  ·  " + clock(s.t);
-    refresh(m);
+    try { refresh(m); } catch (e) { s.errs++; if (s.errs <= 5) note(s, "screen error: " + (e && e.message)); }
   }
 
-  function summary(s, laps) {
+  function summary(s, laps, source) {
     const ok = laps.filter(l => !l.interrupted), best = ok.length ? Math.min(...ok.map(l => l.time)) : null;
-    return { id: s.id, track: s.track, started: s.started, duration: s.t, source: s.source, nLaps: laps.length, best, demo: !!s.demo, version: VERSION,
+    return { id: s.id, track: s.track, started: s.started, duration: s.t, source, nLaps: laps.length, best, demo: !!s.demo, version: VERSION,
              times: laps.map(l => l.interrupted ? null : +l.time.toFixed(3)),
-             sensors: { events: s.events, rate: s.t > 0 ? s.events / s.t : 0, gyro: s.hasGyro, linear: s.hasLin, mic: s.audio.t.length > 0, micDenied: !!s.audio.denied } };
+             sensors: { events: s.events, rate: s.t > 0 ? s.events / s.t : 0, gyro: s.hasGyro, linear: s.hasLin, mic: s.audio.t.length > 0, micDenied: !!s.audio.denied,
+                        gaps: s.gaps, gapTime: +s.gapTime.toFixed(1), screen: s.wake, errors: s.errs },
+             log: s.log.slice() };
   }
+  /* Write the session to the phone. Called every 15 s while driving, when the app is hidden or closed,
+     and at the end. Never throws; the answer says whether the phone's storage took it. */
   async function persist(s, final) {
-    if (final) s.det.update(true);
-    const auto = s.det.laps(), taps = K.lapsFromMarks(s.marks), laps = s.source === "taps" ? taps : auto;
-    const meta = summary(s, laps);
-    meta.detector = { state: s.det.state(), lapLength: s.det.period ? s.det.period / K.FS : null, method: s.det.method, quality: s.det.quality, relearned: s.det.relearned || 0 };
+    let auto = [], taps = [];
+    if (final) { try { s.det.update(true); } catch (e) { s.errs++; note(s, "timing error at the end: " + (e && e.message)); } }
+    try { auto = s.det.laps(); } catch (e) { auto = []; }
+    try { taps = K.lapsFromMarks(s.marks); } catch (e) { taps = []; }
+    // the automatic timing found nothing but the driver tapped: the taps are the lap times
+    const fallback = s.source === "auto" && auto.length < 1 && taps.length >= 1, source = s.source === "taps" || fallback ? "taps" : "auto", laps = source === "taps" ? taps : auto;
+    const meta = summary(s, laps, source);
+    meta.fallback = fallback; meta.open = !final;                         // open: the session was not stopped (the app was closed, or it is still running)
+    try { meta.detector = { state: s.det.state(), lapLength: s.det.period ? s.det.period / K.FS : null, method: s.det.method, quality: s.det.quality, relearned: s.det.relearned || 0 }; } catch (e) { meta.detector = { state: "error" }; }
     const ab = new Uint8Array(s.audio.bins.length * NB); s.audio.bins.forEach((row, i) => ab.set(row, i * NB));
-    await Store.put("sessions", meta);
-    await Store.put("data", { id: s.id, rec: s.rec.data(), nc: COLS.length, y20: Float32Array.from(s.det.y), marks: s.marks.slice(), autoLaps: auto, tapLaps: taps,
-                              audioT: Float32Array.from(s.audio.t), audioBins: ab, nb: NB });
+    const data = { id: s.id, rec: s.rec.data(), nc: COLS.length, y20: Float32Array.from(s.det.y), marks: s.marks.slice(), autoLaps: auto, tapLaps: taps,
+                   audioT: Float32Array.from(s.audio.t), audioBins: ab, nb: NB };
+    // the measurements first: a session listed without its data would be worse than one not listed
+    let ok = await Store.put("data", data);
+    if (!ok && ab.length) ok = await Store.put("data", Object.assign({}, data, { audioT: new Float32Array(0), audioBins: new Uint8Array(0) }));   // short of space: drop the sound picture, keep the rest
+    meta.stored = ok && await Store.put("sessions", meta);
+    if (!meta.stored) mem.sessions.set(meta.id, meta);
     return meta;
   }
-  async function endDrive() {
-    const s = cur; if (!s) return;
+  async function endDrive(why) {
+    const s = cur; if (!s || s.ending) return;
+    s.ending = true; note(s, why || "stopped");
     clearInterval(s.loop); clearInterval(s.autosave);
-    window.removeEventListener("devicemotion", onMotion); document.removeEventListener("visibilitychange", rewake);
+    window.removeEventListener("devicemotion", onMotion); document.removeEventListener("visibilitychange", onVisibility);
+    window.removeEventListener("pagehide", onPageHide); window.removeEventListener("popstate", onBack);
     stopAudio(s);
     try { wake && wake.release(); } catch (e) { /* released */ } wake = null;
-    try { if (document.fullscreenElement) await document.exitFullscreen(); if (screen.orientation && screen.orientation.unlock) screen.orientation.unlock(); } catch (e) { /* optional */ }
     app.innerHTML = `<div class="page"><p class="sub" style="margin-top:40px">Saving the session…</p></div>`;
+    let meta = null;
+    try { meta = await persist(s, true); }
+    catch (e) { meta = { id: s.id, track: s.track, started: s.started, duration: s.t, source: s.source, nLaps: 0, best: null, times: [], stored: false, version: VERSION, log: s.log.slice(), failed: String(e && e.message) }; mem.sessions.set(meta.id, meta); }
     cur = null;
-    const meta = await persist(s, true);
+    try { if (screen.orientation && screen.orientation.unlock) screen.orientation.unlock(); if (document.fullscreenElement) document.exitFullscreen().catch(() => {}); } catch (e) { /* optional */ }
+    try { if (history.state && history.state.drive) history.back(); } catch (e) { /* fine */ }
     viewSaved(meta);
   }
 
@@ -290,15 +419,20 @@
   function viewSaved(meta) {
     app.innerHTML = `<div class="page">
       <div class="top"><div class="mark">${MARK}Apex Trace Kart</div></div>
-      <h1>Session saved</h1>
+      <h1>${meta.stored ? "Session saved" : "Session not stored yet"}</h1>
       <p class="sub">${esc(meta.track)}, ${clock(meta.duration)} on track${meta.demo ? " (simulated)" : ""}.</p>
+      ${meta.stored ? "" : `<div class="note bad">The phone's storage did not take this session (full, or blocked in private browsing). It is still held in memory: tap <b>Save data file</b> now, before closing the app.</div>`}
       <div class="kpis"><div class="kpi"><div class="k">Best lap</div><div class="v c-best">${lapTime(meta.best)}</div></div><div class="kpi"><div class="k">Laps timed</div><div class="v">${meta.nLaps}</div></div></div>
+      ${meta.fallback ? `<p class="small" style="margin-top:10px">The automatic timing did not find the lap in this session, so these are the laps from your taps.</p>` : ""}
+      ${!meta.nLaps && !meta.demo ? `<p class="small" style="margin-top:10px">No lap was timed. The recording itself is kept: open the session and save the data file.</p>` : ""}
       <button class="go" id="again" type="button" style="margin-top:18px">Start a new session</button>
-      <div class="row" style="margin-top:12px"><button class="btn" id="see" type="button">See this session</button><button class="btn" id="home" type="button">All sessions</button></div>
+      <div class="row" style="margin-top:12px"><button class="btn" id="see" type="button">See this session</button><button class="btn" id="savefile" type="button">Save data file</button><button class="btn" id="home" type="button">All sessions</button></div>
       <p class="small" style="margin-top:14px">The new session uses the same track name, lap timing and dashboard. Each session is kept separately on this phone.</p></div>`;
-    $("#again").addEventListener("click", () => startDrive(null));
-    $("#see").addEventListener("click", () => viewReview(meta.id));
-    $("#home").addEventListener("click", viewHome);
+    const shown = performance.now(), ready = () => performance.now() - shown > 500;      // not the press that stopped the session
+    $("#again").addEventListener("click", () => { if (ready()) startDrive(null); });
+    $("#see").addEventListener("click", () => { if (ready()) viewReview(meta.id); });
+    $("#savefile").addEventListener("click", async () => { if (!ready()) return; const data = await Store.get("data", meta.id); if (!data) { toast("The recording of this session is not available."); return; } saveDataFile(meta, data); });
+    $("#home").addEventListener("click", () => { if (ready()) viewHome(); });
   }
 
   /* A finished simulated session, to show what a review looks like before the first real one. */
@@ -307,14 +441,15 @@
     await new Promise(r => setTimeout(r, 30));
     const d = window.KartSim.session({ laps: 13, seed: 21 }), s = newSession("auto");
     cur = s; s.track = "Demo track (simulated)"; s.demo = true;
-    for (let i = 0; i < d.t.length; i++) { sample(d.t[i], [d.lonG[i] * G0, d.latG[i] * G0, 0], [d.lonG[i] * G0, d.latG[i] * G0, G0], [0, 0, d.yaw[i]]); if (i % 60 === 0) s.det.update(); }
-    cur = null;
+    try { for (let i = 0; i < d.t.length; i++) { sample(d.t[i], [d.lonG[i] * G0, d.latG[i] * G0, 0], [d.lonG[i] * G0, d.latG[i] * G0, G0], [0, 0, d.yaw[i]]); if (i % 60 === 0) s.det.update(); } }
+    finally { cur = null; }
     const meta = await persist(s, true);
     viewReview(meta.id);
   }
 
   /* One motion sample. a: acceleration without gravity (may be null), g: with gravity, r: rotation rate
-     about the phone's x, y, z in deg/s. All in the phone's own axes. */
+     about the phone's x, y, z in deg/s. All in the phone's own axes (x to the right of the screen, y to its
+     top, z out of it). */
   function sample(t, a, g, r) {
     const s = cur; if (!s) return;
     let grav, lin;
@@ -327,49 +462,57 @@
     }
     const gn = Math.hypot(grav[0], grav[1], grav[2]) || 1, up = [grav[0] / gn, grav[1] / gn, grav[2] / gn];
     const w = r || [0, 0, 0]; if (r) s.hasGyro = true;
-    // how fast the kart turns = the phone's rotation about the vertical, whatever way the phone is mounted
-    const yaw = w[0] * up[0] + w[1] * up[1] + w[2] * up[2];
+    // how fast the kart turns: the phone's rotation about the vertical, with the phone's own turning
+    // with the steering wheel taken out (see turnRate in core.js)
+    const yaw = K.turnRate ? K.turnRate(w, up) : w[0] * up[0] + w[1] * up[1] + w[2] * up[2];
     const v = lin[0] * up[0] + lin[1] * up[1] + lin[2] * up[2], h = [lin[0] - v * up[0], lin[1] - v * up[1], lin[2] - v * up[2]];
     const gH = Math.hypot(h[0], h[1], h[2]) / G0;
     // the phone turns with the wheel: the direction of "down" across the screen gives the wheel angle (rough)
     const steer = Math.atan2(up[0], up[1]) * 180 / Math.PI;
-    const dt = Math.max(0, Math.min(0.2, t - (s.tS || 0))); s.tS = t; s.t = t; s.events++;
+    const since = t - (s.tS || 0);
+    if (s.events > 0 && since > 0.5) { s.gaps++; s.gapTime += since; note(s, "no motion data for " + since.toFixed(1) + " s"); }
+    const dt = Math.max(0, Math.min(0.2, since)); s.tS = t; s.t = t; s.events++;
     s.gS += (gH - s.gS) * Math.min(1, dt / 0.25);                     // what the eye can follow
     if (s.gS > s.gLapMax) s.gLapMax = s.gS;
     if (s.gS > s.gMax) s.gMax = s.gS;
-    s.rec.push([t, lin[0], lin[1], lin[2], g[0], g[1], g[2], w[0], w[1], w[2], yaw, gH, steer]);
-    s.det.push(t, yaw);
+    s.rec.push([t, lin[0], lin[1], lin[2], g[0], g[1], g[2], w[0], w[1], w[2], yaw, gH, steer]);   // the recording first: it must survive anything below
+    try { s.det.push(t, yaw); } catch (e) { s.errs++; }
   }
 
   function onMotion(e) {
-    if (!cur || cur.sim) return;
+    if (!cur || cur.sim || cur.ending) return;
     const g = e.accelerationIncludingGravity, a = e.acceleration, r = e.rotationRate;
     if (!g || g.x === null || g.x === undefined) return;
     const t = (performance.now() - cur.t0) / 1000;
     sample(t, a && a.x !== null && a.x !== undefined ? [a.x, a.y, a.z] : null, [g.x, g.y, g.z],
-           r && r.alpha !== null && r.alpha !== undefined ? [r.beta || 0, r.gamma || 0, r.alpha || 0] : null);
+           r && r.alpha !== null && r.alpha !== undefined ? [r.alpha || 0, r.beta || 0, r.gamma || 0] : null);     // alpha, beta, gamma = about the phone's x, y, z
   }
 
   /* Engine sound: a compact picture of the sound spectrum ten times a second (not a recording of voices).
      Kept for later work on engine speed; nothing in this version depends on it. */
   const NB = 48, F_LO = 40, F_HI = 3000;
   async function startAudio() {
-    if (!settings.mic || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return;
+    const s = cur;
+    if (!s || !settings.mic || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+      if (cur !== s || s.ending) { stream.getTracks().forEach(t => t.stop()); return; }      // the session ended while the phone was asking for permission
       const AC = window.AudioContext || window.webkitAudioContext, ctx = new AC(), src = ctx.createMediaStreamSource(stream), an = ctx.createAnalyser();
+      if (ctx.state === "suspended" && ctx.resume) ctx.resume().catch(() => {});
       an.fftSize = 4096; an.smoothingTimeConstant = 0.2; src.connect(an);
       const bins = new Uint8Array(an.frequencyBinCount), hz = ctx.sampleRate / an.fftSize, edges = [];
       for (let i = 0; i <= NB; i++) edges.push(Math.round(F_LO * Math.pow(F_HI / F_LO, i / NB) / hz));
-      cur.audio.stream = stream; cur.audio.ctx = ctx;
-      cur.audio.timer = setInterval(() => {
-        if (!cur) return;
-        an.getByteFrequencyData(bins);
-        const row = new Uint8Array(NB);
-        for (let i = 0; i < NB; i++) { let m = 0; for (let j = edges[i]; j <= Math.max(edges[i], edges[i + 1] - 1) && j < bins.length; j++) if (bins[j] > m) m = bins[j]; row[i] = m; }
-        cur.audio.t.push(cur.t); cur.audio.bins.push(row);
+      s.audio.stream = stream; s.audio.ctx = ctx;
+      s.audio.timer = setInterval(() => {
+        if (cur !== s || s.audio.t.length > 60000) return;
+        try {
+          an.getByteFrequencyData(bins);
+          const row = new Uint8Array(NB);
+          for (let i = 0; i < NB; i++) { let m = 0; for (let j = edges[i]; j <= Math.max(edges[i], edges[i + 1] - 1) && j < bins.length; j++) if (bins[j] > m) m = bins[j]; row[i] = m; }
+          s.audio.t.push(s.t); s.audio.bins.push(row);
+        } catch (e) { /* the sound picture is optional */ }
       }, 100);
-    } catch (e) { cur.audio.denied = true; }
+    } catch (e) { s.audio.denied = true; note(s, "microphone not available (" + (e && e.name) + ")"); }
   }
   function stopAudio(s) { try { clearInterval(s.audio.timer); s.audio.stream && s.audio.stream.getTracks().forEach(t => t.stop()); s.audio.ctx && s.audio.ctx.close(); } catch (e) { /* already closed */ } }
 
@@ -381,6 +524,7 @@
     return `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" aria-hidden="true"><polyline points="${pts}" fill="none" stroke="${css("--ink-3")}" stroke-width="1.5"/></svg>`;
   }
   async function viewHome() {
+    if (cur && !cur.ending && $("#dash")) return;   // never leave a running session by accident
     cur = null;
     const sessions = await Store.all();
     const fname = k => FIELDS[k].name.replace(/, live$/, "").toLowerCase();
@@ -401,11 +545,11 @@
       <h2>Sessions</h2>
       ${sessions.length ? `<ul class="sessions">${sessions.map(s => `<li><button type="button" data-open="${esc(s.id)}"><span class="t">${esc(s.track)}</span>
         <span class="b"><b>${lapTime(s.best)}</b><span>best of ${s.nLaps} lap${s.nLaps === 1 ? "" : "s"}</span></span>
-        <span class="d">${new Date(s.started).toLocaleString(undefined, { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}${s.demo ? ", simulated" : ""} &nbsp;${spark(s.times)}</span></button></li>`).join("")}</ul>`
+        <span class="d">${new Date(s.started).toLocaleString(undefined, { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}${s.demo ? ", simulated" : ""}${s.open ? ", <b>not stopped: kept as far as it got</b>" : ""} &nbsp;${spark(s.times)}</span></button></li>`).join("")}</ul>`
         : `<p class="sub">No session yet. Every session you drive is kept on this phone and listed here.</p>`}
       <p class="small" id="offline" style="margin-top:26px"></p>
     </div>`;
-    const note = () => { $("#srcnote").textContent = settings.source === "auto" ? "Laps are found from the way the kart turns. Lap times appear after 2 to 3 laps and include the laps already driven." : "Tap anywhere on the screen each time you cross the line."; };
+    const note = () => { $("#srcnote").textContent = settings.source === "auto" ? "Laps are found from the way the kart turns. Lap times appear after 2 to 3 laps and include the laps already driven. If you also tap the screen at the line, you get times from the first lap, and your taps are kept as a second set of lap times." : "Tap anywhere on the screen each time you cross the line."; };
     note();
     $("#track").addEventListener("input", e => { settings.track = e.target.value; saveSettings(); });
     $$("[data-src]").forEach(b => b.addEventListener("click", () => { settings.source = b.dataset.src; saveSettings(); $$("[data-src]").forEach(x => x.setAttribute("aria-pressed", String(x === b))); note(); }));
@@ -462,17 +606,22 @@
   function viewCheck() {
     app.innerHTML = `<div class="page"><div class="top"><button class="linkbtn" id="back" type="button">&larr; Back</button></div>
       <h1>Check this phone</h1>
-      <p class="sub">Hold the phone and turn it slowly, as if it were on the wheel. Each line turns green when that sensor answers.</p>
+      <p class="sub">Each line turns green when that sensor answers. Then try the two-step test under the list.</p>
       <ul class="checks" id="checks"></ul>
-      <p class="small" style="margin-top:14px">Turn rate now <b class="num" id="cyaw">0</b> deg/s &nbsp; Force now <b class="num" id="cg">0.00</b> G</p>
-      <div class="note">Before a session: switch off the screen's auto-rotate, raise the brightness, and close other apps. The screen stays on by itself while a session runs.</div></div>`;
-    const st = { n: 0, lin: false, gyro: false, t0: performance.now(), yaw: 0, g: 0 };
+      <div class="kpis" style="margin-top:14px"><div class="kpi"><div class="k">Turned so far</div><div class="v"><span id="chead">0</span>°</div><div class="s">turn rate now <span id="cyaw">0</span> deg/s</div></div><div class="kpi"><div class="k">Force now</div><div class="v" id="cg">0.00</div><div class="s">G</div></div></div>
+      <button class="btn" id="czero" type="button" style="margin-top:10px">Set “turned so far” to zero</button>
+      <div class="note"><b>Test 1.</b> Hold the phone upright, screen facing you, as it will sit on the wheel. Set to zero, then turn yourself once round on the spot. “Turned so far” should end near 360 (or −360, turning right).<br>
+        <b>Test 2.</b> Set to zero. Without turning yourself, rotate the phone left and right like a steering wheel. “Turned so far” should stay near 0: the wheel's own movement is not counted as the kart turning.</div>
+      <div class="note">Before a session: switch off the screen's auto-rotate, switch off battery saver, switch on Do Not Disturb, raise the brightness. The screen stays on by itself while a session runs.</div></div>`;
+    const st = { n: 0, lin: false, gyro: false, t0: performance.now(), yaw: 0, g: 0, wake: "", head: 0, last: 0 };
+    (async () => { if (!("wakeLock" in navigator)) { st.wake = "none"; return; } try { const w = await navigator.wakeLock.request("screen"); st.wake = "ok"; setTimeout(() => { try { w.release(); } catch (e) { /* gone */ } }, 1500); } catch (e) { st.wake = "refused"; } })();
     const h = e => {
       const g = e.accelerationIncludingGravity, a = e.acceleration, r = e.rotationRate; if (!g || g.x === null) return;
       st.n++; if (a && a.x !== null && a.x !== undefined) st.lin = true; if (r && r.alpha !== null && r.alpha !== undefined) st.gyro = true;
       if (st.lin && st.gyro) {
-        const gr = [g.x - a.x, g.y - a.y, g.z - a.z], n = Math.hypot(...gr) || 1, up = gr.map(x => x / n), w = [r.beta || 0, r.gamma || 0, r.alpha || 0];
-        st.yaw = w[0] * up[0] + w[1] * up[1] + w[2] * up[2];
+        const gr = [g.x - a.x, g.y - a.y, g.z - a.z], n = Math.hypot(...gr) || 1, up = gr.map(x => x / n), w = [r.alpha || 0, r.beta || 0, r.gamma || 0];
+        st.yaw = K.turnRate(w, up);
+        const now = performance.now(); if (st.last && now - st.last < 500) st.head += st.yaw * (now - st.last) / 1000; st.last = now;
         const v = a.x * up[0] + a.y * up[1] + a.z * up[2]; st.g = Math.hypot(a.x - v * up[0], a.y - v * up[1], a.z - v * up[2]) / G0;
       }
     };
@@ -486,15 +635,16 @@
         li(st.n ? "ok" : "bad", "Motion sensor", st.n ? `Answering ${rate.toFixed(0)} times a second.` : "No answer. This browser or device gives no motion data; lap timing cannot work here.") +
         li(st.gyro ? "ok" : (st.n ? "bad" : ""), "Turn sensor (gyroscope)", st.gyro ? "Present. This is what times your laps and drives the live figure." : "Not found. Without it laps can only be timed by tapping the screen.") +
         li(st.lin ? "ok" : (st.n ? "warn" : ""), "Gravity removed by the phone", st.lin ? "Yes: force readings use the phone's own gravity estimate." : "No: the app estimates gravity itself, force readings are rougher.") +
-        li("wakeLock" in navigator ? "ok" : "warn", "Keeps the screen on", "wakeLock" in navigator ? "Yes." : "Not supported here: set the screen timeout to the longest setting before a session.") +
+        li(st.wake === "ok" ? "ok" : (st.wake === "" ? "" : "warn"), "Keeps the screen on", st.wake === "ok" ? "Yes." : st.wake === "" ? "Checking…" : st.wake === "refused" ? "The phone refused. Switch off battery saver, and set the screen timeout to the longest setting before a session." : "Not supported here: set the screen timeout to the longest setting before a session.") +
         li(navigator.mediaDevices && navigator.mediaDevices.getUserMedia ? "ok" : "warn", "Microphone", navigator.mediaDevices && navigator.mediaDevices.getUserMedia ? "Available. You are asked for permission at the first session." : "Not available in this browser; engine sound is skipped.") +
         li(navigator.serviceWorker && navigator.serviceWorker.controller ? "ok" : "warn", "Works without a connection", navigator.serviceWorker && navigator.serviceWorker.controller ? "Yes." : "Not yet: reload this page once while connected.") +
         li(persisted ? "ok" : "warn", "Sessions protected from clean-up", persisted ? "Yes." : "The browser may clear saved sessions if the phone runs short of space. Save the data file of sessions you care about.");
-      $("#cyaw").textContent = st.yaw.toFixed(0); $("#cg").textContent = st.g.toFixed(2);
+      $("#cyaw").textContent = st.yaw.toFixed(0); $("#cg").textContent = st.g.toFixed(2); $("#chead").textContent = st.head.toFixed(0);
     };
     const timer = setInterval(draw, 500); draw();
     try { navigator.storage && navigator.storage.persist && navigator.storage.persist(); } catch (e) { /* optional */ }
     $("#back").addEventListener("click", () => { window.removeEventListener("devicemotion", h); clearInterval(timer); viewHome(); });
+    $("#czero").addEventListener("click", () => { st.head = 0; $("#chead").textContent = "0"; });
   }
 
   /* ------------------------------------------------------------------ charts */
@@ -602,11 +752,19 @@
     const file = new File([text], name, { type: "text/csv" });
     navigator.share({ files: [file], title: name }).catch(() => {});
   }
+  function fileBase(meta) { return ((meta.track || "session").replace(/[^\w]+/g, "_") || "session") + "_" + new Date(meta.started).toISOString().slice(0, 16).replace(/[:T]/g, "-"); }
+  function saveDataFile(meta, data) {
+    try { download(fileBase(meta) + ".csv", csvOf(meta, data)); toast("Saved to the phone's Downloads folder."); }
+    catch (e) { toast("The file could not be made (" + (e && e.message) + "). The session is still on the phone."); }
+  }
   function csvOf(meta, data) {
-    const nc = data.nc, rec = data.rec, n = rec.length / nc, out = [];
+    const nc = data.nc, rec = data.rec, n = rec.length / nc, out = [], sn = meta.sensors || {};
     out.push(`# Apex Trace Kart ${meta.version || VERSION}`, `# Track,${JSON.stringify(meta.track)}`, `# Started,${new Date(meta.started).toISOString()}`, `# Lap timing,${meta.source}`,
       `# Taps (s),${data.marks.map(x => x.toFixed(3)).join(" ")}`, `# Automatic lap starts (s),${(data.autoLaps || []).map(l => l.start.toFixed(3)).concat((data.autoLaps || []).slice(-1).map(l => l.end.toFixed(3))).join(" ")}`,
-      "# Columns: time s; acceleration without gravity m/s2 (phone axes x y z); acceleration with gravity m/s2; rotation rate deg/s about x y z; turn rate about the vertical deg/s; horizontal force G; wheel angle estimate deg",
+      `# Sensors,${(sn.rate || 0).toFixed(1)} per second; turn sensor ${sn.gyro ? "yes" : "no"}; gravity removed by phone ${sn.linear ? "yes" : "no"}; silences ${sn.gaps || 0} (${sn.gapTime || 0} s); screen lock ${sn.screen || "?"}; errors ${sn.errors || 0}; stopped properly ${meta.open ? "no" : "yes"}`,
+      `# Phone,${JSON.stringify(navigator.userAgent)}`,
+      ...(meta.log || []).map(l => `# Log,${l[0]},${JSON.stringify(l[1])}`),
+      "# Columns: time s; acceleration without gravity m/s2 (phone axes x y z); acceleration with gravity m/s2; rotation rate deg/s about x y z; turn rate of the kart deg/s (rotation about the vertical, the wheel's own rotation removed); horizontal force G; wheel angle estimate deg",
       "time,acc_x,acc_y,acc_z,accg_x,accg_y,accg_z,rot_x,rot_y,rot_z,turn_rate,g_horizontal,wheel_angle");
     const d = [3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 3, 1];
     for (let i = 0; i < n; i++) { const r = []; for (let c = 0; c < nc; c++) r.push(rec[i * nc + c].toFixed(d[c])); out.push(r.join(",")); }
@@ -622,17 +780,37 @@
     return parts.join("; ") + ".";
   }
 
+  const headHtml = meta => `<div class="top"><button class="linkbtn" id="back" type="button">&larr; Sessions</button><button class="btn primary" id="again" type="button">New session</button></div>
+      <h1>${esc(meta.track)}</h1>
+      <p class="sub">${new Date(meta.started).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })}, ${clock(meta.duration)} on track${meta.demo ? ". Simulated data, not a real drive." : ""}${meta.open ? ". This session was not stopped: the app was closed or interrupted, and it is kept as far as it got." : ""}</p>`;
+  const footHtml = meta => `<h2>Session data</h2><p class="sub">${sensorText(meta)}</p>
+      <div class="row"><button class="btn" id="csv" type="button">Save data file</button><button class="btn" id="lapscsv" type="button">Save lap times</button>${canShareFiles() ? `<button class="btn" id="share" type="button">Send data file</button>` : ""}<button class="btn" id="rename" type="button">Rename track</button><button class="btn danger" id="del" type="button">Delete session</button></div>
+      <div id="confirm"></div>`;
+
+  /* The review of a session. If the detailed page cannot be built from this session's data, a plain page
+     takes its place: the lap times and the files are always reachable. */
   async function viewReview(id, opts) {
+    try { await reviewFull(id, opts); }
+    catch (e) { try { await reviewPlain(id, opts, e); } catch (e2) { toast("This session could not be opened (" + (e2 && e2.message) + "). It is still on the phone."); viewHome(); } }
+  }
+  async function reviewPlain(id, opts, err) {
+    const meta = await Store.get("sessions", id), data = await Store.get("data", id);
+    if (!meta || !data) { toast("That session is no longer on this phone."); return viewHome(); }
+    const source = (opts && opts.source) || meta.source, laps = (source === "taps" ? data.tapLaps : data.autoLaps) || [], ok = laps.filter(l => !l.interrupted), best = ok.length ? Math.min(...ok.map(l => l.time)) : null;
+    app.innerHTML = `<div class="page">${headHtml(meta)}
+      <div class="note">The detailed charts could not be drawn for this session. The lap times and the recording are safe: save the data file and send it.<br><span class="small">${esc(err && err.message)}</span></div>
+      <div class="kpis"><div class="kpi"><div class="k">Best lap</div><div class="v c-best">${lapTime(best)}</div></div><div class="kpi"><div class="k">Laps timed</div><div class="v">${laps.length}</div></div></div>
+      <table class="laps"><thead><tr><th>Lap</th><th>Time</th><th>to best</th></tr></thead><tbody>${laps.map(l => `<tr><td>Lap ${l.n}</td><td class="tm ${l.time === best ? "c-best" : ""}">${l.interrupted ? "interrupted" : lapTime(l.time)}</td><td>${l.interrupted || best === null ? "" : l.time === best ? "best" : signedTxt(l.time - best)}</td></tr>`).join("")}</tbody></table>
+      ${footHtml(meta)}</div>`;
+    wireFoot(meta, data, laps, source);
+    window.scrollTo(0, 0);
+  }
+  async function reviewFull(id, opts) {
     opts = opts || {};
     const meta = await Store.get("sessions", id), data = await Store.get("data", id);
     if (!meta || !data) { toast("That session is no longer on this phone."); return viewHome(); }
     const source = opts.source || meta.source, laps = (source === "taps" ? data.tapLaps : data.autoLaps) || [], ok = laps.filter(l => !l.interrupted);
-    const head = `<div class="top"><button class="linkbtn" id="back" type="button">&larr; Sessions</button><button class="btn primary" id="again" type="button">New session</button></div>
-      <h1>${esc(meta.track)}</h1>
-      <p class="sub">${new Date(meta.started).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })}, ${clock(meta.duration)} on track${meta.demo ? ". Simulated data, not a real drive." : ""}</p>`;
-    const foot = `<h2>Session data</h2><p class="sub">${sensorText(meta)}</p>
-      <div class="row"><button class="btn" id="csv" type="button">Save data file</button><button class="btn" id="lapscsv" type="button">Save lap times</button>${canShareFiles() ? `<button class="btn" id="share" type="button">Send data file</button>` : ""}<button class="btn" id="rename" type="button">Rename track</button><button class="btn danger" id="del" type="button">Delete session</button></div>
-      <div id="confirm"></div>`;
+    const head = headHtml(meta), foot = footHtml(meta);
     if (ok.length < 2) {
       app.innerHTML = `<div class="page">${head}
         <div class="note">${laps.length < 1 ? (source === "taps" ? "Fewer than two taps were recorded, so there is no lap to show." :
@@ -647,6 +825,7 @@
     const bestI = ok.reduce((a, l, i) => l.time < ok[a].time ? i : a, 0), best = ok[bestI];
     const times = ok.map(l => l.time), mean = times.reduce((a, b) => a + b, 0) / times.length, sd = Math.sqrt(times.reduce((a, b) => a + (b - mean) * (b - mean), 0) / times.length);
     const ct = K.cornerTimes(data.y20, ok, bestI), nC = ct.corners.length, rows = ct.table.map(r => r || new Array(nC).fill(NaN));
+    if (ct.maps.some(m => !m)) throw new Error("a lap could not be laid over the best lap");
     const cornerBest = []; for (let c = 0; c < nC; c++) cornerBest.push(Math.min(...rows.map(r => r[c]).filter(isFinite)));
     const ideal = cornerBest.reduce((a, b) => a + b, 0);
     let sel = opts.sel; if (sel === undefined) { sel = ok.length - 1; if (sel === bestI) sel = Math.max(0, sel - 1); }
@@ -671,7 +850,7 @@
     let hmax = 0.15; rows.forEach(r => r.forEach((v, c) => { if (isFinite(v)) hmax = Math.max(hmax, v - cornerBest[c]); }));
     const heat = `<table><thead><tr><th></th>${ct.corners.map((c, k) => `<th>T${k + 1}</th>`).join("")}</tr></thead><tbody>${ok.map((l, i) => `<tr><th>Lap ${l.n}</th>${rows[i].map((v, c) => {
       const x = v - cornerBest[c], t = x / hmax; return isFinite(x) ? `<td class="${t < 0.45 ? "dim" : ""}" style="background:${ramp(t)}" title="Lap ${l.n}, turn ${c + 1}: ${x.toFixed(2)} s over the best">${x >= 0.05 ? x.toFixed(2).replace(/^0/, "") : ""}</td>` : "<td></td>"; }).join("")}</tr>`).join("")}</tbody></table>`;
-    const tapsNote = data.marks.length >= 2 ? `<p class="small" style="margin-top:8px">${source === "taps" ? `Laps from your ${data.marks.length} taps.` : `You also tapped the screen ${data.marks.length} times.`}
+    const tapsNote = data.marks.length >= 2 ? `<p class="small" style="margin-top:8px">${source === "taps" ? (meta.fallback && !opts.source ? `The automatic timing did not find the lap in this session, so these are the laps from your ${data.marks.length} taps.` : `Laps from your ${data.marks.length} taps.`) : `You also tapped the screen ${data.marks.length} times.`}
       ${data.autoLaps.length >= 2 ? `<button class="btn" id="swap" type="button" style="margin-left:6px">${source === "taps" ? "Use automatic timing" : "Use my taps"}</button>` : ""}</p>` : "";
     app.innerHTML = `<div class="page">${head}
       <div class="kpis">
@@ -713,8 +892,8 @@
   function wireFoot(meta, data, laps, source) {
     $("#back").addEventListener("click", viewHome);
     $("#again").addEventListener("click", () => startDrive(null));
-    const stamp = new Date(meta.started).toISOString().slice(0, 16).replace(/[:T]/g, "-"), base = (meta.track.replace(/[^\w]+/g, "_") || "session") + "_" + stamp;
-    $("#csv").addEventListener("click", () => { download(base + ".csv", csvOf(meta, data)); toast("Saved to the phone's Downloads folder."); });
+    const base = fileBase(meta);
+    $("#csv").addEventListener("click", () => saveDataFile(meta, data));
     const sh = $("#share"); if (sh) sh.addEventListener("click", () => shareFile(base + ".csv", csvOf(meta, data)));
     $("#lapscsv").addEventListener("click", () => download(base + "_laps.csv", "lap,time_s,start_s,end_s,timed_by,interrupted\n" + laps.map(l => [l.n, l.time.toFixed(3), l.start.toFixed(3), l.end.toFixed(3), source, l.interrupted ? "yes" : "no"].join(",")).join("\n") + "\n"));
     $("#rename").addEventListener("click", () => {
@@ -730,9 +909,24 @@
   }
 
   /* ------------------------------------------------------------------ start */
-  if ("serviceWorker" in navigator && location.protocol !== "file:") navigator.serviceWorker.register("sw.js").then(() => setTimeout(offlineLine, 1500)).catch(() => {});
+  /* Anything that goes wrong unexpectedly is written into the running session's log (and so into its
+     data file); with no session running it is shown. */
+  function report(msg) { msg = String(msg || "unknown").slice(0, 160); if (cur) { cur.errs++; if (cur.errs <= 8) note(cur, "error: " + msg); } else toast("Something went wrong (" + msg + "). Saved sessions are not affected.", 6000); }
+  window.addEventListener("error", e => report(e.message || (e.error && e.error.message)));
+  window.addEventListener("unhandledrejection", e => report(e.reason && e.reason.message || e.reason));
+
+  if ("serviceWorker" in navigator && location.protocol !== "file:") {
+    const had = !!navigator.serviceWorker.controller;
+    // a new version has just been installed in the background: show it, unless a session is running
+    navigator.serviceWorker.addEventListener("controllerchange", () => {
+      if (!had || cur || Array.from(mem.sessions.values()).some(m => m.stored === false)) return;
+      try { const last = Number(sessionStorage.getItem("atk-reload") || 0); if (Date.now() - last < 15000) return; sessionStorage.setItem("atk-reload", String(Date.now())); } catch (e) { return; }
+      location.reload();
+    });
+    navigator.serviceWorker.register("sw.js").then(reg => { setTimeout(offlineLine, 1500); try { reg.update().catch(() => {}); } catch (e) { /* later */ } }).catch(() => {});
+  }
   let rz = null;
   window.addEventListener("resize", () => { clearTimeout(rz); rz = setTimeout(() => { if (app._redraw && $("#lapchart")) app._redraw(); }, 150); });
-  window.__kart = { get cur() { return cur; }, Store, viewHome, viewReview, model, settings };      // for the test suite
+  window.__kart = { get cur() { return cur; }, Store, viewHome, viewReview, model, settings, mem };      // for the test suite
   viewHome();
 })();

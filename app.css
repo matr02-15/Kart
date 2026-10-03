@@ -59,6 +59,7 @@ select { appearance: none; background-image: linear-gradient(45deg, transparent 
 .seg2 button[aria-pressed=true] { background: var(--panel-2); color: var(--ink); font-weight: 600; }
 .switch { display: flex; gap: 12px; align-items: flex-start; padding: 8px 0; cursor: pointer; }
 .switch input { width: 22px; height: 22px; margin-top: 2px; accent-color: var(--amber); flex: none; }
+.note.bad { border-left-color: var(--slower); }
 .note { border-left: 3px solid var(--amber); background: var(--panel); padding: 10px 12px; border-radius: 0 8px 8px 0; margin: 12px 0; font-size: 14.5px; }
 
 .sessions { list-style: none; margin: 8px 0 0; padding: 0; }
@@ -116,7 +117,8 @@ table.laps { width: 100%; border-collapse: collapse; margin-top: 6px; }
 .slots { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 10px; }
 
 /* ------------------------------------------------------------- the dash */
-.dash { position: fixed; inset: 0; background: var(--black); display: flex; flex-direction: column; user-select: none; touch-action: manipulation;
+.dash { position: fixed; inset: 0; background: var(--black); display: flex; flex-direction: column; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+  touch-action: none;        /* no scrolling, zooming or pull-to-refresh while driving: every touch is a tap */
   padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px) env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px); }
 .preview .dash { position: absolute; padding: 0; }
 .dbar { flex: none; height: 6%; min-height: 14px; position: relative; background: #0D0F12; border-bottom: 1px solid var(--line); }
@@ -134,15 +136,30 @@ table.laps { width: 100%; border-collapse: collapse; margin-top: 6px; }
 .dval svg { max-width: 100%; max-height: 100%; width: auto; height: 100%; display: block; }
 .dtile.flash { animation: flash 0.9s ease-out; }
 @keyframes flash { from { background: #3A3D45; } to { background: transparent; } }
-.dfoot { flex: none; display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 1.2vmin 3vmin; min-height: 7vmin; }
+.dfoot { flex: none; display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 1.2vmin 3vmin 2.4vmin; min-height: 7vmin; }
 .dstatus { color: var(--ink-3); font-size: clamp(11px, 2.8vmin, 20px); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .gbar { flex: none; height: 2.4vmin; min-height: 8px; background: #0D0F12; position: relative; border-top: 1px solid var(--line); }
 .gbar i { position: absolute; inset: 0 auto 0 0; background: var(--series-a); width: 0; }
 .gbar em { position: absolute; top: 0; bottom: 0; width: 3px; background: var(--ink); left: 0; }
-.stop { position: relative; border: 2px solid var(--slower); background: transparent; color: var(--ink); border-radius: 999px; padding: 1.4vmin 4.5vmin; font-family: var(--font);
-  font-size: clamp(14px, 3.6vmin, 28px); font-weight: 700; overflow: hidden; cursor: pointer; touch-action: none; flex: none; }
-.stop i { position: absolute; inset: 0 auto 0 0; width: 0; background: var(--slower); z-index: 0; }
-.stop span { position: relative; z-index: 1; }
+/* Stop: one tap asks, a second tap on a big button confirms. Large enough for a hand in a hurry. */
+.stop { border: 2px solid var(--slower); background: transparent; color: var(--ink); border-radius: 999px; padding: 0 7vmin; min-height: max(52px, 11vmin); min-width: max(120px, 30vmin);
+  font-family: var(--font); font-size: clamp(18px, 4.6vmin, 32px); font-weight: 700; letter-spacing: 0.04em; cursor: pointer; touch-action: none; flex: none; }
+.stop:active { background: var(--slower); color: var(--black); }
+.stop:focus-visible, .ask button:focus-visible { outline: 3px solid var(--amber); outline-offset: 3px; }
+.ask { position: fixed; inset: 0; z-index: 5; background: rgba(0, 0, 0, 0.9); display: flex; align-items: center; justify-content: center; padding: 4vmin; touch-action: none; }
+.askbox { width: min(92vw, 560px); display: grid; gap: 3vmin; grid-template-columns: 1fr; }
+.askq { margin: 0; font-family: var(--font); font-weight: 700; font-size: clamp(22px, 6.5vmin, 44px); line-height: 1.1; text-align: center; color: var(--ink); }
+.asks { margin: 0; font-size: clamp(12px, 3vmin, 18px); color: var(--ink-3); text-align: center; }
+.ask button { border-radius: 16px; min-height: max(72px, 19vmin); font-family: var(--font); font-weight: 700; font-size: clamp(22px, 6vmin, 40px); cursor: pointer; touch-action: none; }
+.askyes { background: var(--slower); color: var(--black); border: 0; }
+.askno { background: transparent; color: var(--ink); border: 2px solid var(--ink-2); }
+.askbar { height: 4px; background: var(--line); border-radius: 2px; overflow: hidden; }
+.askbar i { display: block; height: 100%; width: 100%; background: var(--ink-3); transform-origin: left; animation: askrun 8s linear forwards; }
+@keyframes askrun { to { transform: scaleX(0); } }
+@media (orientation: landscape) {
+  .askbox { grid-template-columns: 1fr 1fr; width: min(92vw, 760px); }
+  .askq, .asks, .askbar { grid-column: 1 / -1; }
+}
 .tapmark { position: fixed; inset: 0; border: 1.2vmin solid var(--ink); pointer-events: none; opacity: 0; }
 .tapmark.on { animation: tap 0.5s ease-out; }
 @keyframes tap { from { opacity: 0.9; } to { opacity: 0; } }
@@ -151,7 +168,7 @@ table.laps { width: 100%; border-collapse: collapse; margin-top: 6px; }
   .dash:not(.pv) .dgrid { grid-template-rows: none; grid-template-columns: 1.15fr 1fr; }
   .dash:not(.pv) .dmain { border-bottom: 0; border-right: 1px solid var(--line); }
 }
-@media (prefers-reduced-motion: reduce) { .dtile.flash, .tapmark.on { animation: none; } .dbar .learn { transition: none; } }
+@media (prefers-reduced-motion: reduce) { .dtile.flash, .tapmark.on, .askbar i { animation: none; } .dbar .learn { transition: none; } }
 
 #toast { position: fixed; left: 50%; bottom: calc(18px + env(safe-area-inset-bottom, 0px)); transform: translateX(-50%); background: var(--ink); color: var(--black); padding: 10px 16px;
   border-radius: 8px; font-size: 14.5px; max-width: calc(100% - 32px); z-index: 50; }
