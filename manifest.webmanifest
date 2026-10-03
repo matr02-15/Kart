@@ -1,0 +1,15 @@
+{
+  "name": "Apex Trace Kart",
+  "short_name": "Kart",
+  "description": "Lap times and data from the phone on your kart's steering wheel, indoors, without GPS.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "fullscreen",
+  "orientation": "any",
+  "background_color": "#000000",
+  "theme_color": "#000000",
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}
