@@ -101,6 +101,10 @@ table.laps { width: 100%; border-collapse: collapse; margin-top: 6px; }
 .cbars { margin-top: 6px; }
 .cbar { display: grid; grid-template-columns: 96px 1fr 58px; gap: 10px; align-items: center; padding: 6px 0; border-bottom: 1px solid var(--line); }
 .cbar .nm { font-weight: 500; font-size: 14.5px; white-space: nowrap; } .cbar .nm small { color: var(--ink-3); font-weight: 400; }
+.cbar .sp { grid-column: 1 / -1; margin-top: -4px; font-size: 12.5px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+.cbar .sp b { font-weight: 600; color: var(--ink-2); } .cbar .sp b.c-fast { color: var(--faster); } .cbar .sp b.c-slow { color: var(--slower); }
+h2 small.est { font-size: 12px; font-weight: 500; color: var(--amber-ink); background: var(--amber); border-radius: 4px; padding: 2px 7px; margin-left: 8px; vertical-align: middle; }
+.kpi .v small { font-size: 15px; font-weight: 500; color: var(--ink-3); }
 .cbar .val { text-align: right; font-family: var(--font); font-variant-numeric: tabular-nums; font-weight: 700; font-size: 17px; }
 .dv { position: relative; height: 14px; }
 .dv::before { content: ""; position: absolute; left: 50%; top: -3px; bottom: -3px; width: 1px; background: var(--ink-3); }

@@ -1,7 +1,7 @@
 /* app.js -- Apex Trace Kart 2: screens, sensors and storage. The measuring is in core.js. */
 (function () {
   "use strict";
-  const K = window.KartCore, VERSION = "2.0.1", G0 = 9.80665;
+  const K = window.KartCore, VERSION = "2.1.0", G0 = 9.80665;
   const $ = (s, r) => (r || document).querySelector(s), $$ = (s, r) => Array.from((r || document).querySelectorAll(s));
   const esc = s => String(s === null || s === undefined ? "" : s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
   const app = $("#app");
@@ -49,7 +49,7 @@
   /* ------------------------------------------------------------------ settings (this phone only) */
   const FIELD_KEYS = ["current", "delta", "pred", "last", "best", "lastdiff", "lastprev", "lap", "avg3", "clock", "left", "gnow", "gpeak"];
   const DEFAULT_DASH = { main: "current", tiles: ["delta", "last", "best", "lap"], deltaBar: true, gBar: true };
-  const settings = { track: "", source: "auto", mic: true, minutes: 0, dash: JSON.parse(JSON.stringify(DEFAULT_DASH)) };
+  const settings = { track: "", trackLength: 0, source: "auto", mic: true, loc: true, minutes: 0, dash: JSON.parse(JSON.stringify(DEFAULT_DASH)) };
   try {
     const saved = JSON.parse(localStorage.getItem("atk-settings") || "{}");
     Object.assign(settings, saved);
@@ -109,7 +109,8 @@
   function newSession(source) {
     return { id: "s" + Date.now().toString(36), track: settings.track.trim() || "Unnamed track", started: Date.now(), source, rec: new Rec(), det: new K.LapDetector(),
              marks: [], t: 0, gf: null, gS: 0, gLapMax: 0, gMax: 0, events: 0, hasLin: false, hasGyro: false, audio: { t: [], bins: [] }, lastLapN: 0, sim: null,
-             trk: null, trkRef: null, trkPasses: -1, trkAnchor: 0, log: [], gaps: 0, gapTime: 0, errs: 0, wake: "not asked", ending: false };
+             trk: null, trkRef: null, trkPasses: -1, trkAnchor: 0, log: [], gaps: 0, gapTime: 0, errs: 0, wake: "not asked", ending: false,
+             trackLength: Number(settings.trackLength) > 0 ? Number(settings.trackLength) : 0, loc: [], locWatch: null };
   }
   /* What happened during the session, with the time it happened: kept with the session and written into
      the data file, so that a problem at the track can be understood afterwards. */
@@ -282,6 +283,27 @@
   }
   function onPageHide() { const s = cur; if (s && !s.sim && !s.ending) { note(s, "app closed while recording"); persist(s, false).catch(() => {}); } }
 
+  /* The phone's own location, as it reports it, with the accuracy it claims. Indoors it is rarely good
+     enough for anything but knowing which building this is; outdoors it carries a real speed, which the
+     review compares with the app's own estimate. Recorded so that the data file answers the question. */
+  async function startLocation(s) {
+    if (!settings.loc || !navigator.geolocation) return;
+    // Only when it has already been allowed (on the "Check this phone" page): no question while sitting in the kart.
+    try { if (navigator.permissions && navigator.permissions.query) { const st = await navigator.permissions.query({ name: "geolocation" }); if (st.state !== "granted") { note(s, "location not logged: not allowed yet (allow it on Check this phone)"); return; } } } catch (e) { /* cannot ask: try anyway */ }
+    if (cur !== s || s.ending) return;
+    try {
+      s.locWatch = navigator.geolocation.watchPosition(p => {
+        if (cur !== s || s.ending || s.loc.length >= 8000) return;
+        const c = p.coords, n = v => (v === null || v === undefined || !isFinite(v)) ? null : v;
+        // the time the fix was MADE (it arrives later): in session seconds, when the phone's clock allows it
+        let t = s.t; const made = p.timestamp ? (p.timestamp - s.started) / 1000 : null; if (made !== null && made > s.t - 10 && made <= s.t + 0.5) t = Math.max(0, made);
+        s.loc.push([+t.toFixed(2), n(c.latitude), n(c.longitude), n(c.accuracy), n(c.speed), n(c.heading)]);
+      }, e => { if (cur === s && !s.locNoted && e && e.code !== 3) { s.locNoted = true; note(s, "location not available (" + (e.message || e.code) + ")"); } },
+      { enableHighAccuracy: true, maximumAge: 0, timeout: 30000 });
+    } catch (e) { note(s, "location not available"); }
+  }
+  function stopLocation(s) { try { if (s.locWatch !== null && navigator.geolocation) navigator.geolocation.clearWatch(s.locWatch); } catch (e) { /* gone */ } s.locWatch = null; }
+
   async function startDrive(sim) {
     if (cur || starting) return;                 // a second tap on "Start" must not start a second session
     starting = true;
@@ -294,6 +316,7 @@
       } else {
         window.addEventListener("devicemotion", onMotion);
         startAudio();
+        startLocation(s);
         try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {}); } catch (e) { /* optional */ }
       }
       refresh = buildDash(app, settings.dash, {});
@@ -329,7 +352,7 @@
       const d = s.sim.d, until = (performance.now() - s.sim.t0) / 1000 * s.sim.speed;
       while (s.sim.i < d.t.length && d.t[s.sim.i] <= until) {
         const i = s.sim.i++;
-        sample(d.t[i], [d.lonG[i] * G0, d.latG[i] * G0, 0], [d.lonG[i] * G0, d.latG[i] * G0, G0], [0, 0, d.yaw[i]]);
+        simSample(d, i);
       }
       if (s.sim.i >= d.t.length) { endDrive("simulation finished"); return; }
     } else {
@@ -385,11 +408,12 @@
     // the automatic timing found nothing but the driver tapped: the taps are the lap times
     const fallback = s.source === "auto" && auto.length < 1 && taps.length >= 1, source = s.source === "taps" || fallback ? "taps" : "auto", laps = source === "taps" ? taps : auto;
     const meta = summary(s, laps, source);
+    meta.trackLength = s.trackLength || 0;
     meta.fallback = fallback; meta.open = !final;                         // open: the session was not stopped (the app was closed, or it is still running)
     try { meta.detector = { state: s.det.state(), lapLength: s.det.period ? s.det.period / K.FS : null, method: s.det.method, quality: s.det.quality, relearned: s.det.relearned || 0 }; } catch (e) { meta.detector = { state: "error" }; }
     const ab = new Uint8Array(s.audio.bins.length * NB); s.audio.bins.forEach((row, i) => ab.set(row, i * NB));
     const data = { id: s.id, rec: s.rec.data(), nc: COLS.length, y20: Float32Array.from(s.det.y), marks: s.marks.slice(), autoLaps: auto, tapLaps: taps,
-                   audioT: Float32Array.from(s.audio.t), audioBins: ab, nb: NB };
+                   audioT: Float32Array.from(s.audio.t), audioBins: ab, nb: NB, loc: s.loc.slice() };
     // the measurements first: a session listed without its data would be worse than one not listed
     let ok = await Store.put("data", data);
     if (!ok && ab.length) ok = await Store.put("data", Object.assign({}, data, { audioT: new Float32Array(0), audioBins: new Uint8Array(0) }));   // short of space: drop the sound picture, keep the rest
@@ -404,6 +428,7 @@
     window.removeEventListener("devicemotion", onMotion); document.removeEventListener("visibilitychange", onVisibility);
     window.removeEventListener("pagehide", onPageHide); window.removeEventListener("popstate", onBack);
     stopAudio(s);
+    stopLocation(s);
     try { wake && wake.release(); } catch (e) { /* released */ } wake = null;
     app.innerHTML = `<div class="page"><p class="sub" style="margin-top:40px">Saving the session…</p></div>`;
     let meta = null;
@@ -441,10 +466,20 @@
     await new Promise(r => setTimeout(r, 30));
     const d = window.KartSim.session({ laps: 13, seed: 21 }), s = newSession("auto");
     cur = s; s.track = "Demo track (simulated)"; s.demo = true;
-    try { for (let i = 0; i < d.t.length; i++) { sample(d.t[i], [d.lonG[i] * G0, d.latG[i] * G0, 0], [d.lonG[i] * G0, d.latG[i] * G0, G0], [0, 0, d.yaw[i]]); if (i % 60 === 0) s.det.update(); } }
+    try { for (let i = 0; i < d.t.length; i++) { simSample(d, i); if (i % 60 === 0) s.det.update(); } }
     finally { cur = null; }
     const meta = await persist(s, true);
     viewReview(meta.id);
+  }
+
+  /* The simulated kart, as a phone on its steering wheel would report it: screen facing the driver, raked
+     back with the column. Kart axes: x to the right, y forward, z up; a left turn is a positive turn rate
+     and pushes the kart to the left. */
+  const SIM_RAKE = 0.96, SIM_C = Math.cos(SIM_RAKE), SIM_S = Math.sin(SIM_RAKE);
+  function simSample(d, i) {
+    const toPhone = v => [v[0], v[1] * SIM_C + v[2] * SIM_S, -v[1] * SIM_S + v[2] * SIM_C];
+    const lin = toPhone([-d.latG[i] * G0, d.lonG[i] * G0, 0]), g = toPhone([-d.latG[i] * G0, d.lonG[i] * G0, G0]);
+    sample(d.t[i], lin, g, toPhone([0, 0, d.yaw[i]]));
   }
 
   /* One motion sample. a: acceleration without gravity (may be null), g: with gravity, r: rotation rate
@@ -532,6 +567,7 @@
       <div class="top"><div class="mark">${MARK}Apex Trace Kart <small>${VERSION}</small></div></div>
       <div class="card">
         <div class="field" style="margin-top:0"><label for="track">Track</label><input type="text" id="track" value="${esc(settings.track)}" placeholder="Name of the track" autocomplete="off" maxlength="40"></div>
+        <div class="field"><label for="tlen">Length of the track in metres, if you know it (makes speed and distance more accurate)</label><input type="number" id="tlen" min="0" max="5000" step="1" inputmode="numeric" placeholder="not known" value="${Number(settings.trackLength) > 0 ? Number(settings.trackLength) : ""}"></div>
         <div class="lbl" style="margin-bottom:6px">Lap timing</div>
         <div class="seg2" role="group" aria-label="Lap timing"><button type="button" data-src="auto" aria-pressed="${settings.source === "auto"}">Automatic</button><button type="button" data-src="taps" aria-pressed="${settings.source === "taps"}">My taps at the line</button></div>
         <p class="small" id="srcnote" style="margin:8px 0 14px"></p>
@@ -551,7 +587,8 @@
     </div>`;
     const note = () => { $("#srcnote").textContent = settings.source === "auto" ? "Laps are found from the way the kart turns. Lap times appear after 2 to 3 laps and include the laps already driven. If you also tap the screen at the line, you get times from the first lap, and your taps are kept as a second set of lap times." : "Tap anywhere on the screen each time you cross the line."; };
     note();
-    $("#track").addEventListener("input", e => { settings.track = e.target.value; saveSettings(); });
+    $("#track").addEventListener("input", e => { settings.track = e.target.value; if (settings.trackLength) { settings.trackLength = 0; $("#tlen").value = ""; } saveSettings(); });
+    $("#tlen").addEventListener("input", e => { settings.trackLength = Math.max(0, Math.min(5000, Number(e.target.value) || 0)); saveSettings(); });
     $$("[data-src]").forEach(b => b.addEventListener("click", () => { settings.source = b.dataset.src; saveSettings(); $$("[data-src]").forEach(x => x.setAttribute("aria-pressed", String(x === b))); note(); }));
     $("#start").addEventListener("click", () => startDrive(null));
     $("#simdrive").addEventListener("click", () => startDrive({ speed: 12 }));
@@ -586,6 +623,7 @@
       <label class="switch" style="margin-top:14px"><input type="checkbox" id="dbar" ${d.deltaBar ? "checked" : ""}><span>Bar across the top: green grows to the left when you are ahead of your best lap, red to the right when behind</span></label>
       <label class="switch"><input type="checkbox" id="gbar" ${d.gBar ? "checked" : ""}><span>Force bar along the bottom</span></label>
       <div class="field"><label for="minutes">Session length in minutes, for “Time left” (0 = not used)</label><input type="number" id="minutes" min="0" max="120" step="1" value="${settings.minutes || 0}" inputmode="numeric"></div>
+      <label class="switch"><input type="checkbox" id="loc" ${settings.loc ? "checked" : ""}><span>Log the phone's location<br><span class="small">With the accuracy the phone claims. Indoors it shows what the phone's location is worth at this track; outdoors it gives a real speed to check the app's estimate against. It stays on this phone and in the data file.</span></span></label>
       <label class="switch"><input type="checkbox" id="mic" ${settings.mic ? "checked" : ""}><span>Log engine sound<br><span class="small">A picture of the sound's pitch ten times a second, not a recording. Kept for future work on engine speed.</span></span></label>
       <div class="row" style="margin-top:10px"><button class="btn" id="reset" type="button">Back to the standard dashboard</button></div>
       <div class="note">The live “plus or minus to best lap” needs one complete lap to compare with, so it starts once laps are being timed. It moves in the corners and holds on the straights, because it follows how the kart turns.</div></div>`;
@@ -593,7 +631,7 @@
     const read = () => {
       settings.dash.main = $("#main").value; settings.dash.tiles = $$("[data-slot]").map(s => s.value).filter(Boolean);
       settings.dash.deltaBar = $("#dbar").checked; settings.dash.gBar = $("#gbar").checked;
-      settings.minutes = Math.max(0, Math.min(120, Number($("#minutes").value) || 0)); settings.mic = $("#mic").checked;
+      settings.minutes = Math.max(0, Math.min(120, Number($("#minutes").value) || 0)); settings.mic = $("#mic").checked; settings.loc = $("#loc").checked;
       saveSettings(); draw();
     };
     $$("select, input", app).forEach(e => e.addEventListener("change", read));
@@ -613,7 +651,8 @@
       <div class="note"><b>Test 1.</b> Hold the phone upright, screen facing you, as it will sit on the wheel. Set to zero, then turn yourself once round on the spot. “Turned so far” should end near 360 (or −360, turning right).<br>
         <b>Test 2.</b> Set to zero. Without turning yourself, rotate the phone left and right like a steering wheel. “Turned so far” should stay near 0: the wheel's own movement is not counted as the kart turning.</div>
       <div class="note">Before a session: switch off the screen's auto-rotate, switch off battery saver, switch on Do Not Disturb, raise the brightness. The screen stays on by itself while a session runs.</div></div>`;
-    const st = { n: 0, lin: false, gyro: false, t0: performance.now(), yaw: 0, g: 0, wake: "", head: 0, last: 0 };
+    const st = { n: 0, lin: false, gyro: false, t0: performance.now(), yaw: 0, g: 0, wake: "", head: 0, last: 0, loc: "" };
+    try { if (navigator.permissions && navigator.permissions.query) navigator.permissions.query({ name: "geolocation" }).then(p => { st.loc = p.state; p.onchange = () => { st.loc = p.state; }; }).catch(() => {}); } catch (e) { /* unknown */ }
     (async () => { if (!("wakeLock" in navigator)) { st.wake = "none"; return; } try { const w = await navigator.wakeLock.request("screen"); st.wake = "ok"; setTimeout(() => { try { w.release(); } catch (e) { /* gone */ } }, 1500); } catch (e) { st.wake = "refused"; } })();
     const h = e => {
       const g = e.accelerationIncludingGravity, a = e.acceleration, r = e.rotationRate; if (!g || g.x === null) return;
@@ -636,9 +675,11 @@
         li(st.gyro ? "ok" : (st.n ? "bad" : ""), "Turn sensor (gyroscope)", st.gyro ? "Present. This is what times your laps and drives the live figure." : "Not found. Without it laps can only be timed by tapping the screen.") +
         li(st.lin ? "ok" : (st.n ? "warn" : ""), "Gravity removed by the phone", st.lin ? "Yes: force readings use the phone's own gravity estimate." : "No: the app estimates gravity itself, force readings are rougher.") +
         li(st.wake === "ok" ? "ok" : (st.wake === "" ? "" : "warn"), "Keeps the screen on", st.wake === "ok" ? "Yes." : st.wake === "" ? "Checking…" : st.wake === "refused" ? "The phone refused. Switch off battery saver, and set the screen timeout to the longest setting before a session." : "Not supported here: set the screen timeout to the longest setting before a session.") +
+        li(st.loc === "granted" ? "ok" : "warn", "Location", st.loc === "granted" ? "Allowed. It is logged with each session, to see what it is worth at each track." : st.loc === "denied" ? "Refused in the browser's settings for this site. The app works without it." : !navigator.geolocation ? "Not available in this browser." : `Not allowed yet. <button class="btn" type="button" id="locallow" style="margin-top:6px">Allow location</button>`) +
         li(navigator.mediaDevices && navigator.mediaDevices.getUserMedia ? "ok" : "warn", "Microphone", navigator.mediaDevices && navigator.mediaDevices.getUserMedia ? "Available. You are asked for permission at the first session." : "Not available in this browser; engine sound is skipped.") +
         li(navigator.serviceWorker && navigator.serviceWorker.controller ? "ok" : "warn", "Works without a connection", navigator.serviceWorker && navigator.serviceWorker.controller ? "Yes." : "Not yet: reload this page once while connected.") +
         li(persisted ? "ok" : "warn", "Sessions protected from clean-up", persisted ? "Yes." : "The browser may clear saved sessions if the phone runs short of space. Save the data file of sessions you care about.");
+      const la = $("#locallow"); if (la) la.onclick = () => navigator.geolocation.getCurrentPosition(() => { st.loc = "granted"; }, e => { if (e && e.code === 1) st.loc = "denied"; }, { enableHighAccuracy: true, timeout: 20000 });
       $("#cyaw").textContent = st.yaw.toFixed(0); $("#cg").textContent = st.g.toFixed(2); $("#chead").textContent = st.head.toFixed(0);
     };
     const timer = setInterval(draw, 500); draw();
@@ -689,49 +730,65 @@
   /* One lap against another, along the lap. Top: time gained or lost so far. Bottom: how the kart turned.
      Both share the same horizontal axis (position on the lap), so they read together. Drag a finger across
      to read any point. */
-  function compareChart(cv, tip, ct, laps, bestI, refI, sel, names) {
-    const { c, W, H } = canvas(cv, 340), padL = 46, padR = 12, padT = 24, gap = 26, padB = 26, w = W - padL - padR;
-    const hTop = Math.round((H - padT - padB - gap) * 0.52), hBot = H - padT - padB - gap - hTop, y0 = padT, y1 = padT + hTop + gap;
+  function compareChart(cv, tip, ct, laps, bestI, refI, sel, names, sp) {
+    const has = !!(sp && sp.v), { c, W, H } = canvas(cv, has ? 480 : 340), padL = 46, padR = 12, padT = 24, gap = 26, padB = 26, w = W - padL - padR;
+    const plot = H - padT - padB - gap * (has ? 2 : 1), hTop = Math.round(plot * (has ? 0.32 : 0.52)), hS = has ? Math.round(plot * 0.38) : 0, hBot = plot - hTop - hS;
+    const y0 = padT, yS = y0 + hTop + gap, y1 = has ? yS + hS + gap : yS;
     const n = ct.ref.length, fs = ct.fs, mapS = ct.maps[sel].map, mapR = ct.maps[refI].map, sigS = ct.sigs[sel], sigR = ct.sigs[refI];
     const at = (sig, x) => { const i0 = Math.max(0, Math.min(sig.length - 2, Math.floor(x))), f = x - i0; return sig[i0] * (1 - f) + sig[i0 + 1] * f; };
-    const delta = new Float32Array(n), a = new Float32Array(n), b = new Float32Array(n); let dmax = 0.1, ymax = 10;
-    for (let i = 0; i < n; i++) { delta[i] = (mapS[i] - mapR[i]) / fs; a[i] = at(sigR, mapR[i]); b[i] = at(sigS, mapS[i]); dmax = Math.max(dmax, Math.abs(delta[i])); ymax = Math.max(ymax, Math.abs(a[i]), Math.abs(b[i])); }
+    const delta = new Float32Array(n), a = new Float32Array(n), b = new Float32Array(n), va = new Float32Array(n), vb = new Float32Array(n); let dmax = 0.1, ymax = 10, vlo = 1e9, vhi = 0;
+    for (let i = 0; i < n; i++) {
+      delta[i] = (mapS[i] - mapR[i]) / fs; a[i] = at(sigR, mapR[i]); b[i] = at(sigS, mapS[i]); dmax = Math.max(dmax, Math.abs(delta[i])); ymax = Math.max(ymax, Math.abs(a[i]), Math.abs(b[i]));
+      if (has) { va[i] = sp.at(laps[refI].start + mapR[i] / fs); vb[i] = sp.at(laps[sel].start + mapS[i] / fs); vlo = Math.min(vlo, va[i], vb[i]); vhi = Math.max(vhi, va[i], vb[i]); }
+    }
     dmax *= 1.15; ymax *= 1.1;
-    const X = i => padL + w * i / (n - 1), Yd = v => y0 + hTop / 2 - (hTop / 2) * v / dmax, Yt = v => y1 + hBot / 2 - (hBot / 2) * v / ymax;
+    if (has) { const pad = Math.max(2, 0.08 * (vhi - vlo)); vlo = Math.max(0, vlo - pad); vhi += pad; }
+    const X = i => padL + w * i / (n - 1), Yd = v => y0 + hTop / 2 - (hTop / 2) * v / dmax, Yt = v => y1 + hBot / 2 - (hBot / 2) * v / ymax, Yv = v => yS + hS * (1 - (v - vlo) / (vhi - vlo || 1));
     const draw = hover => {
       c.clearRect(0, 0, W, H);
-      // corners: a faint band and a number each, shared by both panels
+      // corners: a faint band and a number each, shared by all panels
       c.textAlign = "center";
       ct.corners.forEach((k, j) => { if (j % 2 === 0) { c.fillStyle = "rgba(255,255,255,0.04)"; c.fillRect(X(k.i0), y0, X(k.i1) - X(k.i0), H - padB - y0); } c.fillStyle = css("--ink-3"); c.fillText(String(j + 1), X(k.apex), y0 - 11); });
       // top panel: time gained or lost so far
       c.strokeStyle = css("--line"); c.lineWidth = 1; c.fillStyle = css("--ink-3"); c.textAlign = "right";
-      ticksFor(-dmax, dmax, 4).forEach(v => { c.beginPath(); c.moveTo(padL, Yd(v)); c.lineTo(W - padR, Yd(v)); c.stroke(); c.fillText((v > 0 ? "+" : v < 0 ? "−" : "") + Math.abs(v).toFixed(2), padL - 8, Yd(v)); });
+      ticksFor(-dmax, dmax, has ? 3 : 4).forEach(v => { c.beginPath(); c.moveTo(padL, Yd(v)); c.lineTo(W - padR, Yd(v)); c.stroke(); c.fillText((v > 0 ? "+" : v < 0 ? "−" : "") + Math.abs(v).toFixed(2), padL - 8, Yd(v)); });
       const area = (pos, col) => { c.beginPath(); c.moveTo(X(0), Yd(0)); for (let i = 0; i < n; i++) c.lineTo(X(i), Yd(pos ? Math.max(0, delta[i]) : Math.min(0, delta[i]))); c.lineTo(X(n - 1), Yd(0)); c.closePath(); c.fillStyle = col; c.fill(); };
       area(true, "rgba(240,70,60,0.32)"); area(false, "rgba(25,196,90,0.32)");
       c.strokeStyle = css("--ink-2"); c.beginPath(); c.moveTo(padL, Yd(0)); c.lineTo(W - padR, Yd(0)); c.stroke();
       c.strokeStyle = css("--ink"); c.lineWidth = 2; c.lineJoin = "round"; c.beginPath(); for (let i = 0; i < n; i++) { if (i) c.lineTo(X(i), Yd(delta[i])); else c.moveTo(X(i), Yd(delta[i])); } c.stroke();
       c.textAlign = "left"; c.fillStyle = css("--slower"); c.fillText("slower", padL + 6, y0 + 9); c.fillStyle = css("--faster"); c.fillText("faster", padL + 6, y0 + hTop - 9);
       c.textAlign = "right"; c.fillStyle = css("--ink"); c.fillText((delta[n - 1] >= 0 ? "+" : "−") + Math.abs(delta[n - 1]).toFixed(2) + " s at the line", W - padR - 4, Math.max(y0 + 9, Math.min(y0 + hTop - 9, Yd(delta[n - 1]) - 11)));
+      const line = (arr, Y, col, lw) => { c.strokeStyle = col; c.lineWidth = lw; c.lineJoin = "round"; c.beginPath(); for (let i = 0; i < n; i++) { if (i) c.lineTo(X(i), Y(arr[i])); else c.moveTo(X(i), Y(arr[i])); } c.stroke(); };
+      // middle panel: speed of both laps (an estimate)
+      if (has) {
+        c.strokeStyle = css("--line"); c.lineWidth = 1; c.fillStyle = css("--ink-3"); c.textAlign = "right";
+        ticksFor(vlo, vhi, 3).forEach(v => { c.beginPath(); c.moveTo(padL, Yv(v)); c.lineTo(W - padR, Yv(v)); c.stroke(); c.fillText(v.toFixed(0), padL - 8, Yv(v)); });
+        c.textAlign = "left"; c.fillText("speed, km/h (estimated)", padL, yS - 10);
+        line(va, Yv, css("--series-a"), 4); line(vb, Yv, css("--series-b"), 2);
+      }
       // bottom panel: turn rate of both laps
       c.strokeStyle = css("--line"); c.lineWidth = 1; c.beginPath(); c.moveTo(padL, Yt(0)); c.lineTo(W - padR, Yt(0)); c.stroke();
       c.fillStyle = css("--ink-3"); c.textAlign = "right"; c.fillText("left", padL - 8, y1 + 8); c.fillText("right", padL - 8, y1 + hBot - 8);
-      const line = (arr, col, lw) => { c.strokeStyle = col; c.lineWidth = lw; c.beginPath(); for (let i = 0; i < n; i++) { if (i) c.lineTo(X(i), Yt(arr[i])); else c.moveTo(X(i), Yt(arr[i])); } c.stroke(); };
-      line(a, css("--series-a"), 4); line(b, css("--series-b"), 2);
+      if (has) { c.textAlign = "left"; c.fillText("how the kart turned", padL, y1 - 10); }
+      line(a, Yt, css("--series-a"), 4); line(b, Yt, css("--series-b"), 2);
       c.fillStyle = css("--ink-3"); c.textAlign = "center"; [0, 0.25, 0.5, 0.75, 1].forEach(f => c.fillText((f * (n - 1) / fs).toFixed(0) + " s", padL + w * f, H - 10));
       if (hover !== null && hover !== undefined) {
         c.strokeStyle = css("--ink-2"); c.lineWidth = 1; c.beginPath(); c.moveTo(X(hover), y0); c.lineTo(X(hover), H - padB); c.stroke();
-        [[Yd(delta[hover]), css("--ink")], [Yt(a[hover]), css("--series-a")], [Yt(b[hover]), css("--series-b")]].forEach(p => { c.beginPath(); c.arc(X(hover), p[0], 4.5, 0, 6.3); c.fillStyle = p[1]; c.fill(); c.lineWidth = 2; c.strokeStyle = css("--panel"); c.stroke(); });
+        const dots = [[Yd(delta[hover]), css("--ink")], [Yt(a[hover]), css("--series-a")], [Yt(b[hover]), css("--series-b")]];
+        if (has) dots.push([Yv(va[hover]), css("--series-a")], [Yv(vb[hover]), css("--series-b")]);
+        dots.forEach(p => { c.beginPath(); c.arc(X(hover), p[0], 4.5, 0, 6.3); c.fillStyle = p[1]; c.fill(); c.lineWidth = 2; c.strokeStyle = css("--panel"); c.stroke(); });
       }
     };
     draw(null);
     const move = e => {
       const r = cv.getBoundingClientRect(), i = Math.max(0, Math.min(n - 1, Math.round((e.clientX - r.left - padL) / w * (n - 1))));
       draw(i);
-      const k = ct.corners.findIndex(q => i >= q.i0 && i <= q.i1), d = delta[i];
+      const k = ct.corners.findIndex(q => i >= q.i0 && i <= q.i1), d = delta[i], dv = has ? vb[i] - va[i] : 0;
       tip.hidden = false;
       tip.innerHTML = `${k >= 0 ? "Turn " + (k + 1) : "Lap"}, ${(i / fs).toFixed(1)} s in<br><b style="color:${d > 0.005 ? css("--slower") : d < -0.005 ? css("--faster") : css("--ink")}">${signedTxt(d)} s</b> so far<br>` +
-        `<span style="color:${css("--series-a")}">●</span> ${esc(names.ref)} <b>${a[i].toFixed(0)}</b> deg/s<br><span style="color:${css("--series-b")}">●</span> ${esc(names.sel)} <b>${b[i].toFixed(0)}</b> deg/s`;
-      const px = e.clientX - r.left; tip.style.left = Math.max(4, Math.min(r.width - 150, px + (px > r.width / 2 ? -150 : 14))) + "px"; tip.style.top = (cv.offsetTop + y0 + 4) + "px";
+        `<span style="color:${css("--series-a")}">●</span> ${esc(names.ref)} ${has ? `<b>${va[i].toFixed(0)}</b> km/h, ` : ""}<b>${a[i].toFixed(0)}</b> deg/s<br><span style="color:${css("--series-b")}">●</span> ${esc(names.sel)} ${has ? `<b>${vb[i].toFixed(0)}</b> km/h, ` : ""}<b>${b[i].toFixed(0)}</b> deg/s` +
+        (has ? `<br>speed difference <b style="color:${dv < -0.5 ? css("--slower") : dv > 0.5 ? css("--faster") : css("--ink")}">${signedTxt(dv, 1)} km/h</b>` : "");
+      const px = e.clientX - r.left; tip.style.left = Math.max(4, Math.min(r.width - 170, px + (px > r.width / 2 ? -170 : 14))) + "px"; tip.style.top = (cv.offsetTop + y0 + 4) + "px";
     };
     cv.onpointerdown = cv.onpointermove = move;
     cv.onpointerleave = () => { tip.hidden = true; draw(null); };
@@ -764,6 +821,9 @@
       `# Sensors,${(sn.rate || 0).toFixed(1)} per second; turn sensor ${sn.gyro ? "yes" : "no"}; gravity removed by phone ${sn.linear ? "yes" : "no"}; silences ${sn.gaps || 0} (${sn.gapTime || 0} s); screen lock ${sn.screen || "?"}; errors ${sn.errors || 0}; stopped properly ${meta.open ? "no" : "yes"}`,
       `# Phone,${JSON.stringify(navigator.userAgent)}`,
       ...(meta.log || []).map(l => `# Log,${l[0]},${JSON.stringify(l[1])}`),
+      `# Track length given (m),${meta.trackLength || ""}`,
+      ...((data.loc || []).length ? ["# Location fixes: time s, latitude, longitude, accuracy m, GPS speed m/s, heading deg"] : []),
+      ...(data.loc || []).map(p => "# Loc," + p.map(x => x === null ? "" : x).join(",")),
       "# Columns: time s; acceleration without gravity m/s2 (phone axes x y z); acceleration with gravity m/s2; rotation rate deg/s about x y z; turn rate of the kart deg/s (rotation about the vertical, the wheel's own rotation removed); horizontal force G; wheel angle estimate deg",
       "time,acc_x,acc_y,acc_z,accg_x,accg_y,accg_z,rot_x,rot_y,rot_z,turn_rate,g_horizontal,wheel_angle");
     const d = [3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 3, 1];
@@ -783,9 +843,65 @@
   const headHtml = meta => `<div class="top"><button class="linkbtn" id="back" type="button">&larr; Sessions</button><button class="btn primary" id="again" type="button">New session</button></div>
       <h1>${esc(meta.track)}</h1>
       <p class="sub">${new Date(meta.started).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })}, ${clock(meta.duration)} on track${meta.demo ? ". Simulated data, not a real drive." : ""}${meta.open ? ". This session was not stopped: the app was closed or interrupted, and it is kept as far as it got." : ""}</p>`;
-  const footHtml = meta => `<h2>Session data</h2><p class="sub">${sensorText(meta)}</p>
-      <div class="row"><button class="btn" id="csv" type="button">Save data file</button><button class="btn" id="lapscsv" type="button">Save lap times</button>${canShareFiles() ? `<button class="btn" id="share" type="button">Send data file</button>` : ""}<button class="btn" id="rename" type="button">Rename track</button><button class="btn danger" id="del" type="button">Delete session</button></div>
+  const footHtml = meta => `<h2>Session data</h2><p class="sub">${sensorText(meta)}</p><p class="sub" id="locline"></p>
+      <div class="row"><button class="btn" id="csv" type="button">Save data file</button><button class="btn" id="lapscsv" type="button">Save lap times</button><button class="btn" id="pcfile" type="button" hidden>Save for Apex Trace on the computer</button>${canShareFiles() ? `<button class="btn" id="share" type="button">Send data file</button>` : ""}<button class="btn" id="rename" type="button">Rename track</button><button class="btn danger" id="del" type="button">Delete session</button></div>
       <div id="confirm"></div>`;
+
+  /* Speed and distance of a saved session, worked out from its recording (see estimateSpeed in core.js).
+     An estimate: nothing here has yet been checked against a real measurement of a kart's speed.
+     With the track length given, the speed is scaled so that a lap is that long. */
+  let speedCache = null, ctCache = null;
+  function speedOf(meta, data, laps, source) {
+    const key = meta.id + "|" + source + "|" + (meta.trackLength || 0) + "|" + data.rec.length;
+    if (speedCache && speedCache.key === key) return speedCache.sp;
+    let sp;
+    try {
+      const mo = K.motion(data.rec, data.nc);
+      if (!mo.yaw.length) sp = { why: "There is no motion recording in this session." };
+      else if (meta.sensors && (meta.sensors.gyro === false || meta.sensors.linear === false)) sp = { why: "This phone gave no turn rate, or no acceleration with gravity removed, so speed cannot be worked out from it." };
+      else if (mo.usable < 0.6) sp = { why: meta.demo ? "This simulated session was recorded by an earlier version, which did not simulate the phone's position on the wheel. Open a new demo session to see speed." : "The phone was lying too flat to tell forward from sideways, so speed could not be worked out. It needs the screen facing the driver." };
+      else {
+        const est = K.estimateSpeed(mo.yaw, mo.lat, mo.lon), ok = laps.filter(l => !l.interrupted);
+        const lens = ok.map(l => K.distanceBetween(est.v, l.start, l.end)).sort((a, b) => a - b), med = lens.length ? lens[lens.length >> 1] : 0, L = Number(meta.trackLength) || 0;
+        let k = 1, scaled = false, refused = false;
+        if (L > 0 && med > 0) { const kk = L / med; if (kk > 0.75 && kk < 1.33) { k = kk; scaled = true; } else refused = true; }
+        const v = est.v; if (k !== 1) for (let i = 0; i < v.length; i++) v[i] *= k;
+        const fs = est.fs, at = t => { const x = t * fs - 0.5, i0 = Math.max(0, Math.min(v.length - 2, Math.floor(x))), f = Math.max(0, Math.min(1, x - i0)); return 3.6 * (v[i0] * (1 - f) + v[i0 + 1] * f); };
+        // outdoors the phone's own GPS gives a real speed: how far is the estimate from it?
+        let gps = null; const fixes = (data.loc || []).filter(p => p[4] !== null && p[3] !== null && p[3] <= 10 && p[4] > 3);
+        if (fixes.length >= 20) {
+          // a GPS speed describes a moment slightly in the past: find the delay at which the two agree best
+          let bestLag = 0, bestE = 1e9;
+          for (let lag = 0; lag <= 2.01; lag += 0.1) { const e = fixes.map(p => Math.abs(at(p[0] - lag) / 3.6 - p[4]) / p[4]).sort((a, b) => a - b), m = e[e.length >> 1]; if (m < bestE) { bestE = m; bestLag = lag; } }
+          const r = fixes.map(p => (at(p[0] - bestLag) / 3.6) / p[4]).sort((a, b) => a - b);
+          gps = { n: fixes.length, ratio: r[r.length >> 1], typical: bestE, lag: bestLag };
+        }
+        sp = { v, fs, at, k, scaled, refused, rawLen: med, len: med * k, mo, gps, flipped: est.flipped };
+      }
+    } catch (e) { sp = { why: "Speed could not be worked out for this session (" + (e && e.message) + ")." }; }
+    speedCache = { key, sp };
+    return sp;
+  }
+  /* A file the computer program (Apex Trace) reads: time, speed, forces, turn rate and lap markers at 20 a second. */
+  function pcFile(meta, data, laps, sp) {
+    const mo = sp.mo, n = Math.min(sp.v.length, mo.yaw.length), fs = sp.fs, out = [], q = x => '"' + String(x).replace(/"/g, "'") + '"', d = new Date(meta.started), pad = x => String(x).padStart(2, "0");
+    const marks = laps.length ? laps.map(l => l.start).concat([laps[laps.length - 1].end]) : [];
+    const row = a => out.push(a.map(q).join(","));
+    row(["Format", "MoTeC CSV File", "", "", "Workbook", ""]); row(["Venue", meta.track, "", "", "Worksheet", ""]); row(["Vehicle", "Kart", "", "", "Vehicle Desc", ""]);
+    row(["Driver", "", "", "", "Engine ID", ""]); row(["Device", "Apex Trace Kart " + (meta.version || VERSION) + " (phone)"]);
+    row(["Comment", "Speed and distance are ESTIMATES from the phone's motion sensors" + (sp.scaled ? ", scaled to a track length of " + meta.trackLength + " m" : "") + ". No pedals, no GPS.", "", "", "Session", "Kart"]);
+    row(["Log Date", `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()}`, "", "", "Origin Time", "0.000", "s"]); row(["Log Time", `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`, "", "", "Start Time", "0.000", "s"]);
+    row(["Sample Rate", fs.toFixed(3), "Hz", "", "End Time", (n / fs).toFixed(3), "s"]); row(["Duration", (n / fs).toFixed(3), "s", "", "Start Distance", "0", "m"]); row(["Range", "entire outing", "", "", "End Distance", "", "m"]);
+    row(["Beacon Markers", marks.filter(t => t > 0 && t < n / fs).map(t => t.toFixed(3)).join(" ")]);
+    out.push("", ""); row(["Time", "Ground Speed", "G Force Lat", "G Force Long", "Chassis Yaw Rate", "Lap Number"]); row(["s", "km/h", "G", "G", "deg/s", ""]); out.push("", "");
+    let lap = 0;
+    for (let i = 0; i < n; i++) {
+      const t = (i + 0.5) / fs; while (lap < marks.length && marks[lap] <= t) lap++;
+      const f = sp.flipped ? -1 : 1, la = mo.lat[i], lo = mo.lon[i];
+      row([t.toFixed(3), (3.6 * sp.v[i]).toFixed(2), isFinite(la) ? (f * la / G0).toFixed(3) : "", isFinite(lo) ? (f * lo / G0).toFixed(3) : "", mo.yaw[i].toFixed(2), lap]);
+    }
+    return out.join("\n") + "\n";
+  }
 
   /* The review of a session. If the detailed page cannot be built from this session's data, a plain page
      takes its place: the lap times and the files are always reachable. */
@@ -824,7 +940,12 @@
     }
     const bestI = ok.reduce((a, l, i) => l.time < ok[a].time ? i : a, 0), best = ok[bestI];
     const times = ok.map(l => l.time), mean = times.reduce((a, b) => a + b, 0) / times.length, sd = Math.sqrt(times.reduce((a, b) => a + (b - mean) * (b - mean), 0) / times.length);
-    const ct = K.cornerTimes(data.y20, ok, bestI), nC = ct.corners.length, rows = ct.table.map(r => r || new Array(nC).fill(NaN));
+    const sp = speedOf(meta, data, laps, source), hasSp = !!sp.v;
+    // a phone that is not square on the wheel: its turn rate is worked out again with the column's real direction
+    const y20 = hasSp && sp.mo.axis && sp.mo.yaw.length >= data.y20.length - 4 ? sp.mo.yaw : data.y20;
+    const ctKey = id + "|" + source + "|" + bestI + "|" + ok.length + "|" + y20.length + "|" + (y20 === data.y20 ? "z" : "c");
+    if (!ctCache || ctCache.key !== ctKey) ctCache = { key: ctKey, ct: K.cornerTimes(y20, ok, bestI) };
+    const ct = ctCache.ct, nC = ct.corners.length, rows = ct.table.map(r => r || new Array(nC).fill(NaN));
     if (ct.maps.some(m => !m)) throw new Error("a lap could not be laid over the best lap");
     const cornerBest = []; for (let c = 0; c < nC; c++) cornerBest.push(Math.min(...rows.map(r => r[c]).filter(isFinite)));
     const ideal = cornerBest.reduce((a, b) => a + b, 0);
@@ -840,12 +961,27 @@
         <td>${l.interrupted ? "" : l === best ? "best" : signedTxt(l.time - best.time)}</td><td class="${p && !l.interrupted ? (l.time <= p.time ? "c-fast" : "c-slow") : ""}">${p && !l.interrupted ? signedTxt(l.time - p.time) : ""}</td>
         <td>${l.interrupted ? "" : gOf(l).toFixed(2)}</td></tr>`;
     }).join("");
+    // slowest point of each turn, on the lap looked at and on the lap it is compared with
+    const slowest = (li, cr) => { const mp = ct.maps[li].map; let mn = 1e9; for (let i = cr.i0; i <= cr.i1; i += 2) mn = Math.min(mn, sp.at(ok[li].start + mp[i] / ct.fs)); return mn; };
     const cbars = ct.corners.map((c, k) => {
       const v = loss[k], w = 50 * Math.abs(v) / lmax, col = v >= 0.03 ? "--slower" : v <= -0.03 ? "--faster" : "--ink-3";
+      const vs = hasSp ? slowest(sel, c) : 0, vr = hasSp ? slowest(refI, c) : 0;
       return `<div class="cbar"><div class="nm">Turn ${k + 1} <small>${c.dir > 0 ? "left" : c.dir < 0 ? "right" : ""}</small></div>
         <div class="dv"><i style="${v >= 0 ? `left:50%;width:${w.toFixed(1)}%` : `right:50%;width:${w.toFixed(1)}%`};background:var(${col})"></i></div>
-        <div class="val" style="color:var(${col === "--ink-3" ? "--ink-2" : col})">${signedTxt(v)}</div></div>`;
+        <div class="val" style="color:var(${col === "--ink-3" ? "--ink-2" : col})">${signedTxt(v)}</div>
+        ${hasSp ? `<div class="sp">slowest point ${vs.toFixed(0)} km/h, against ${vr.toFixed(0)} <b class="${vs - vr > 0.5 ? "c-fast" : vs - vr < -0.5 ? "c-slow" : ""}">${signedTxt(vs - vr, 1)}</b></div>` : ""}</div>`;
     }).join("");
+    const topOf = l => { let m = 0; for (let t = l.start; t < l.end; t += 0.1) m = Math.max(m, sp.at(t)); return m; };
+    const speedBlock = hasSp ? `
+      <h2 id="spd">Speed and distance <small class="est">estimated</small></h2>
+      <div class="kpis">
+        <div class="kpi"><div class="k">Top speed, best lap</div><div class="v">${topOf(best).toFixed(0)} <small>km/h</small></div><div class="s">${esc(selName.toLowerCase())}: ${topOf(ok[sel]).toFixed(0)} km/h</div></div>
+        <div class="kpi"><div class="k">Lap length</div><div class="v">${sp.len.toFixed(0)} <small>m</small></div><div class="s">${sp.scaled ? `set by you (the sensors alone gave ${sp.rawLen.toFixed(0)} m)` : "worked out from the sensors"}</div></div>
+      </div>
+      <p class="small" style="margin-top:8px">Worked out from the phone's motion sensors: in a turn, speed is the sideways force divided by how fast the kart turns; between turns the forward force carries it along. <b>It has not yet been checked against a real measurement of a kart's speed.</b> The difference between two of your laps is more reliable than the figures themselves.${sp.mo.axis ? ` The phone was found to sit ${sp.mo.offSquare.toFixed(0)}° off square on the wheel, and this is allowed for.` : ""}${sp.gps ? ` Against the phone's GPS speed (${sp.gps.n} good fixes): the estimate is typically ${(100 * sp.gps.typical).toFixed(0)}% away, and ${(100 * Math.abs(sp.gps.ratio - 1)).toFixed(0)}% ${sp.gps.ratio > 1 ? "high" : "low"} overall.` : ""}</p>
+      ${sp.refused ? `<p class="small" style="color:var(--slower)">The track length you gave (${Number(meta.trackLength).toFixed(0)} m) is too far from what the sensors found (${sp.rawLen.toFixed(0)} m) to be used. Check it.</p>` : ""}
+      <div class="field" style="max-width:420px"><label for="tl2">Length of the track in metres, if you know it: the speed is then scaled so that a lap is that long</label><div class="row" style="margin:0"><input type="number" id="tl2" min="0" max="5000" step="1" inputmode="numeric" placeholder="not known" value="${Number(meta.trackLength) > 0 ? Number(meta.trackLength) : ""}" style="max-width:160px"><button class="btn" id="tl2ok" type="button">Apply</button></div></div>`
+      : `<h2 id="spd">Speed and distance</h2><p class="sub">${esc(sp.why || "Not available for this session.")}</p>`;
     // every lap through every corner, against the best time anyone lap set in that corner
     let hmax = 0.15; rows.forEach(r => r.forEach((v, c) => { if (isFinite(v)) hmax = Math.max(hmax, v - cornerBest[c]); }));
     const heat = `<table><thead><tr><th></th>${ct.corners.map((c, k) => `<th>T${k + 1}</th>`).join("")}</tr></thead><tbody>${ok.map((l, i) => `<tr><th>Lap ${l.n}</th>${rows[i].map((v, c) => {
@@ -869,10 +1005,11 @@
       <p class="sub" style="margin-top:12px">${esc(selName)} was <b class="${ok[sel].time - ok[refI].time > 0 ? "c-slow" : "c-fast"}">${signedTxt(ok[sel].time - ok[refI].time)} s</b> against ${esc(refName.toLowerCase())}. ${loss[worst] >= 0.1 ? `Most of the loss is in <b>turn ${worst + 1}</b> (${loss[worst].toFixed(2)} s).` : "No single turn lost a tenth or more."}</p>
       <div class="chartcard"><div class="legend"><span><i style="background:var(--ink)"></i>time lost or gained so far</span><span><i style="background:var(--series-a)"></i>${esc(refName)}</span><span><i style="background:var(--series-b)"></i>${esc(selName)}</span></div>
         <canvas id="cmpchart"></canvas><div class="tip" id="tip" hidden></div></div>
-      <p class="small" style="margin-top:8px">Top: the gap as the lap unfolds, rising where ${esc(selName.toLowerCase())} falls behind. Bottom: how the kart turned (up is left, down is right). The numbers along the top are the turns. Drag a finger across to read any point.</p>
+      <p class="small" style="margin-top:8px">Top: the gap as the lap unfolds, rising where ${esc(selName.toLowerCase())} falls behind. ${hasSp ? "Middle: the speed of both laps (an estimate, see below). " : ""}Bottom: how the kart turned (up is left, down is right). The numbers along the top are the turns. Drag a finger across to read any point.</p>
       <h2>Turn by turn</h2><p class="sub">Time through each turn, with the run into it, against ${esc(refName.toLowerCase())}. Red is time lost, green is time gained.</p>
       <div class="cbars">${cbars}</div>
       <p class="small" style="margin-top:8px">Turns are placed by matching the turn pattern of the laps. A few hundredths is within the method's noise; a tenth or more is worth a look.</p>`}
+      ${speedBlock}
       <h2>Where the time goes, every lap</h2><p class="sub">Each box is one lap through one turn: how much slower than your quickest pass of that turn. A light column is a turn you often get wrong; a light row is a poor lap.</p>
       <div class="chartcard"><div class="legend"><span><i class="sq" style="background:${ramp(0)}"></i>at your best</span><span><i class="sq" style="background:${ramp(0.5)}"></i></span><span><i class="sq" style="background:${ramp(1)}"></i>${hmax.toFixed(2)} s slower</span></div><div class="heat">${heat}</div></div>
       ${foot}</div>`;
@@ -880,16 +1017,24 @@
     $$("[data-sel]").forEach(r => r.addEventListener("click", () => { const i = Number(r.dataset.sel); if (i >= 0) go({ sel: i }); }));
     $$("[data-ref]").forEach(b => b.addEventListener("click", () => { if (!b.disabled) go({ ref: b.dataset.ref }); }));
     const sw = $("#swap"); if (sw) sw.addEventListener("click", () => viewReview(id, { source: source === "taps" ? "auto" : "taps" }));
-    wireFoot(meta, data, laps, source);
+    wireFoot(meta, data, laps, source, hasSp ? sp : null);
+    const tl = $("#tl2ok"); if (tl) tl.addEventListener("click", async () => { meta.trackLength = Math.max(0, Math.min(5000, Number($("#tl2").value) || 0)); await Store.put("sessions", meta); go({ scroll: "spd" }); });
     const drawAll = () => {
       lapChart($("#lapchart"), null, ok, bestI, sel, i => go({ sel: i }));
-      if (!same) compareChart($("#cmpchart"), $("#tip"), ct, ok, bestI, refI, sel, { ref: refName, sel: selName });
+      if (!same) compareChart($("#cmpchart"), $("#tip"), ct, ok, bestI, refI, sel, { ref: refName, sel: selName }, hasSp ? sp : null);
     };
     drawAll(); app._redraw = drawAll;
     if (opts.scroll) { const h = $("#" + opts.scroll); if (h) h.scrollIntoView({ block: "start" }); } else window.scrollTo(0, 0);
   }
 
-  function wireFoot(meta, data, laps, source) {
+  function wireFoot(meta, data, laps, source, sp) {
+    const loc = data.loc || [], ll = $("#locline");
+    if (ll && loc.length) {
+      const acc = loc.map(p => p[3]).filter(x => x !== null).sort((a, b) => a - b), withSpeed = loc.filter(p => p[4] !== null).length;
+      ll.textContent = `Location from the phone: ${loc.length} fix${loc.length === 1 ? "" : "es"}, one every ${(meta.duration / loc.length).toFixed(1)} s on average` + (acc.length ? `, accuracy claimed ${acc[acc.length >> 1].toFixed(0)} m typically (best ${acc[0].toFixed(0)} m)` : "") + (withSpeed ? `, ${withSpeed} with a GPS speed.` : ", none with a GPS speed.") + (acc.length && acc[acc.length >> 1] > 8 ? " Too coarse to place the kart on the track." : "");
+    } else if (ll) ll.textContent = meta.demo ? "" : "No location was received from the phone during this session.";
+    const pc = $("#pcfile");
+    if (pc && sp) { pc.hidden = false; pc.addEventListener("click", () => { try { download(fileBase(meta) + "_for_ApexTrace.csv", pcFile(meta, data, laps, sp)); toast("Saved to the phone's Downloads folder."); } catch (e) { toast("The file could not be made (" + (e && e.message) + ")."); } }); }
     $("#back").addEventListener("click", viewHome);
     $("#again").addEventListener("click", () => startDrive(null));
     const base = fileBase(meta);

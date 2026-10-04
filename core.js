@@ -39,11 +39,211 @@
      rebuild the turn rate from the rotation about the two axes in the screen. This is exact for a
      phone square on the wheel and equally exact for a phone on a fixed mount. It cannot work when the
      screen faces straight up (nothing of "up" lies in the screen), so the plain answer takes over there. */
-  function turnRate(w, up) {
-    var plain = w[0] * up[0] + w[1] * up[1] + w[2] * up[2], h2 = up[0] * up[0] + up[1] * up[1];
-    if (h2 <= 0.12) return plain;
-    var k = Math.min(1, (h2 - 0.12) / 0.18);
-    return plain + k * ((w[0] * up[0] + w[1] * up[1]) / h2 - plain);
+  function turnRate(w, up, c) {
+    var plain = w[0] * up[0] + w[1] * up[1] + w[2] * up[2];
+    if (!c) {                                          // the usual case: the column along the phone's z axis
+      var h2 = up[0] * up[0] + up[1] * up[1];
+      if (h2 <= 0.12) return plain;
+      var k = Math.min(1, (h2 - 0.12) / 0.18);
+      return plain + k * ((w[0] * up[0] + w[1] * up[1]) / h2 - plain);
+    }
+    // c: the direction of the steering column in the phone's axes, when the phone is not square on the wheel
+    var wc = w[0] * c[0] + w[1] * c[1] + w[2] * c[2], uc = up[0] * c[0] + up[1] * c[1] + up[2] * c[2];
+    var ux = up[0] - uc * c[0], uy = up[1] - uc * c[1], uz = up[2] - uc * c[2], g2 = ux * ux + uy * uy + uz * uz;
+    if (g2 <= 0.12) return plain;
+    var k2 = Math.min(1, (g2 - 0.12) / 0.18);
+    return plain + k2 * (((w[0] - wc * c[0]) * ux + (w[1] - wc * c[1]) * uy + (w[2] - wc * c[2]) * uz) / g2 - plain);
+  }
+
+  /* Where the steering column points in the phone's own axes.
+     The phone turns in two ways: with the kart (slowly, corner by corner) and with the steering wheel
+     (quickly: every correction of the hands). The quick part of its rotation is therefore almost all
+     about the steering column. So: take the rotation-rate samples, remove their slow part, and find the
+     direction along which what is left is strongest. This uses the gyroscope only, so an imperfect
+     "level" in corners does not disturb it.
+     ws: array of [x, y, z] rotation rates (deg/s) at `rate` samples a second. Returns a unit vector, or
+     null when no direction stands out (a phone on a fixed mount, or too little driving): the phone's z
+     axis is then used, which is right for a phone lying square in the plane of the wheel. */
+  function mountAxis(ws, rate) {
+    var n = ws.length, i, k, half = Math.max(2, Math.round(0.25 * (rate || 60)));
+    if (n < 40 * half) return null;
+    var cx = new Float64Array(n + 1), cy = new Float64Array(n + 1), cz = new Float64Array(n + 1);
+    for (i = 0; i < n; i++) { cx[i + 1] = cx[i] + ws[i][0]; cy[i + 1] = cy[i] + ws[i][1]; cz[i + 1] = cz[i] + ws[i][2]; }
+    var a = 0, b = 0, c = 0, d = 0, e = 0, f = 0, m = 0;     // covariance [[a,b,c],[b,d,e],[c,e,f]] of the quick part
+    for (i = half; i < n - half; i++) {
+      var w0 = i - half, w1 = i + half + 1, len = w1 - w0;
+      var x = ws[i][0] - (cx[w1] - cx[w0]) / len, y = ws[i][1] - (cy[w1] - cy[w0]) / len, z = ws[i][2] - (cz[w1] - cz[w0]) / len;
+      a += x * x; b += x * y; c += x * z; d += y * y; e += y * z; f += z * z; m++;
+    }
+    var A = [[a / m, b / m, c / m], [b / m, d / m, e / m], [c / m, e / m, f / m]], V = [[1, 0, 0], [0, 1, 0], [0, 0, 1]], it, p, q;
+    for (it = 0; it < 30; it++) {                            // Jacobi rotations: eigenvectors of a symmetric 3x3
+      p = 0; q = 1; if (Math.abs(A[0][2]) > Math.abs(A[p][q])) { p = 0; q = 2; } if (Math.abs(A[1][2]) > Math.abs(A[p][q])) { p = 1; q = 2; }
+      if (Math.abs(A[p][q]) < 1e-12) break;
+      var th = 0.5 * Math.atan2(2 * A[p][q], A[q][q] - A[p][p]), cs = Math.cos(th), sn = Math.sin(th);
+      for (k = 0; k < 3; k++) { var akp = A[k][p], akq = A[k][q]; A[k][p] = cs * akp - sn * akq; A[k][q] = sn * akp + cs * akq; }
+      for (k = 0; k < 3; k++) { var apk = A[p][k], aqk = A[q][k]; A[p][k] = cs * apk - sn * aqk; A[q][k] = sn * apk + cs * aqk; }
+      for (k = 0; k < 3; k++) { var vkp = V[k][p], vkq = V[k][q]; V[k][p] = cs * vkp - sn * vkq; V[k][q] = sn * vkp + cs * vkq; }
+    }
+    var ev = [A[0][0], A[1][1], A[2][2]], order = [0, 1, 2].sort(function (x1, y1) { return ev[y1] - ev[x1]; }), hi = order[0], mid = order[1];
+    // one direction must clearly stand out, and by more than sensor noise
+    if (ev[hi] < 225 || ev[hi] < 5 * Math.max(ev[mid], 1e-9)) return null;
+    var ax = [V[0][hi], V[1][hi], V[2][hi]], s = ax[2] < 0 ? -1 : 1, nn = Math.sqrt(ax[0] * ax[0] + ax[1] * ax[1] + ax[2] * ax[2]) || 1;
+    return { axis: [s * ax[0] / nn, s * ax[1] / nn, s * ax[2] / nn], strength: Math.sqrt(ev[hi]), ratio: ev[hi] / Math.max(ev[mid], 1e-9) };
+  }
+
+  /* ---------------------------------------------------------------- forces, speed and distance */
+  /* The force on the kart, split into "forward" (+ accelerating, - braking) and "sideways" (+ towards the
+     left), in m/s2, from the phone's acceleration with gravity removed (lin) and the direction of "up"
+     (both in the phone's own axes).
+     The phone turns with the wheel, so its own axes say nothing fixed about the kart. But the steering
+     column does: it leans back towards the driver in the kart's fore-and-aft plane whatever the wheel
+     angle, and a phone lying in the plane of the wheel has the column along its z axis (out of the
+     screen, towards the driver). So the level part of the phone's z axis points to the back of the kart.
+     Returns null when the screen faces straight up or down (no level part to go by).
+     c: the direction of the column in the phone's axes when it is not the z axis (see mountAxis). */
+  function kartForces(lin, up, c) {
+    var cx = c ? c[0] : 0, cy = c ? c[1] : 0, cz = c ? c[2] : 1, uc = up[0] * cx + up[1] * cy + up[2] * cz;
+    var bx = cx - uc * up[0], by = cy - uc * up[1], bz = cz - uc * up[2], n = Math.sqrt(bx * bx + by * by + bz * bz);
+    if (n < 0.35) return null;
+    var fx = -bx / n, fy = -by / n, fz = -bz / n;                                  // forward
+    var lx = up[1] * fz - up[2] * fy, ly = up[2] * fx - up[0] * fz, lz = up[0] * fy - up[1] * fx;   // left = up x forward
+    return [lin[0] * fx + lin[1] * fy + lin[2] * fz, lin[0] * lx + lin[1] * ly + lin[2] * lz];
+  }
+
+  /* Brings any stream of samples to the working rate (the same averaging as the lap detector's). */
+  function Slots(fs) { this.fs = fs || FS; this.v = []; this._acc = 0; this._n = 0; this._next = 0; }
+  Slots.prototype.push = function (t, x) {
+    var silent = Math.floor(t * this.fs) - this._next > Math.round(0.5 * this.fs);
+    while (t >= (this._next + 1) / this.fs) {
+      this.v.push(this._n ? this._acc / this._n : (silent ? 0 : (this.v.length ? this.v[this.v.length - 1] : 0)));
+      this._acc = 0; this._n = 0; this._next++;
+    }
+    if (isFinite(x)) { this._acc += x; this._n++; }
+  };
+
+  /* SPEED WITHOUT GPS. Two things the phone measures say something about speed:
+       in a corner     speed = sideways force / turn rate          (an absolute value, but only while turning)
+       everywhere      change of speed = forward force x time      (always there, but it drifts)
+     They are combined the standard way (a Kalman filter run forwards, then smoothed backwards over the
+     whole recording): the forward force carries the speed along, each corner corrects it, and a slow
+     error of the forward force (the phone's idea of "level" is never perfect) is estimated on the way.
+     The result is an ESTIMATE. Its accuracy on a real kart is not yet known.
+
+       yaw     turn rate, deg/s, at fs          alat, alon   sideways and forward force, m/s2, at fs
+       opts    lever: how far the phone sits ahead of the kart's rear axle, m (the kart's turning adds
+               to what it feels there)
+     Returns {v: speed m/s per sample, sd: its uncertainty, flipped, bias}. */
+  var SPD = { sa: 0.5, sb: 0.04, st: 0.06, sl: 0.7, lever: 0.6 };
+  function speedPrep(yaw, alat, alon, fs, opts) {
+    var n = Math.min(yaw.length, alat.length, alon.length), lever = opts && opts.lever !== undefined ? opts.lever : SPD.lever, i, D2R = Math.PI / 180;
+    var w = new Float64Array(n), lat = new Float64Array(n), lon = new Float64Array(n), wd = new Float64Array(n), sm = 2;
+    function smooth(src, k0) { var cc = new Float64Array(n + 1), out = new Float64Array(n), k; for (k = 0; k < n; k++) cc[k + 1] = cc[k] + (isFinite(src[k]) ? src[k] * k0 : 0); for (k = 0; k < n; k++) { var a2 = Math.max(0, k - sm), b2 = Math.min(n, k + sm + 1); out[k] = (cc[b2] - cc[a2]) / (b2 - a2); } return out; }
+    w = smooth(yaw, D2R);
+    var la = smooth(alat, 1), lo = smooth(alon, 1), s = 0;
+    for (i = 0; i < n; i++) s += la[i] * w[i];
+    // a sideways force and a turn must point the same way (force = speed x turn rate, speed is positive):
+    // if they do not, the phone faces the other way round, and forward is backward too
+    var flip = s < 0 ? -1 : 1;
+    for (i = 0; i < n; i++) {
+      var i1 = Math.min(n - 1, i + 2), i0 = Math.max(0, i - 2);
+      wd[i] = (w[i1] - w[i0]) * fs / (i1 - i0 || 1);
+      lat[i] = flip * la[i] - lever * wd[i];          // take out what the phone feels from being ahead of the kart's centre
+      lon[i] = flip * lo[i] + lever * w[i] * w[i];
+    }
+    // how noisy the turn rate still is after the smoothing above (rad/s), from how far each sample sits from its neighbours
+    var d2 = [], sw = 0;
+    for (i = 1; i < n - 1; i++) d2.push(Math.abs(yaw[i] - 0.5 * (yaw[i - 1] + yaw[i + 1])));
+    if (d2.length) sw = median(d2) * 1.4826 / Math.sqrt(1.5) / Math.sqrt(2 * sm + 1) * D2R;
+    return { n: n, w: w, wd: wd, lat: lat, lon: lon, flipped: flip < 0, lever: lever, sw: sw };
+  }
+  /* The filter. State: speed v, the slow error of the forward force (bl) and of the sideways force (bt).
+       each step        v grows by (forward force - bl) x time
+       each sample      sideways force = v x turn rate + bt        (the corner relation; on a straight it shows bt)
+     Run forwards, then smoothed backwards over the whole recording (Rauch-Tung-Striebel). */
+  function estimateSpeed(yaw, alat, alon, fs, opts) {
+    fs = fs || FS;
+    var P = speedPrep(yaw, alat, alon, fs, opts), n = P.n, dt = 1 / fs, i, r, c, k;
+    var Q = [Math.pow(SPD.sa, 2) * dt, Math.pow(SPD.sb, 2) * dt, Math.pow(SPD.st, 2) * dt];
+    var xf = new Float64Array(3 * n), Pf = new Float64Array(9 * n), xp = new Float64Array(3 * n), Pp = new Float64Array(9 * n);
+    var x = [0, 0, 0], M = [4, 0, 0, 0, 0.3, 0, 0, 0, 0.3];
+    function mul(A, B) { var o = new Array(9); for (r = 0; r < 3; r++) for (c = 0; c < 3; c++) { var t = 0; for (k = 0; k < 3; k++) t += A[r * 3 + k] * B[k * 3 + c]; o[r * 3 + c] = t; } return o; }
+    function tr(A) { return [A[0], A[3], A[6], A[1], A[4], A[7], A[2], A[5], A[8]]; }
+    function inv(A) {
+      var a = A[0], b = A[1], cc = A[2], d = A[3], e = A[4], f = A[5], g = A[6], h = A[7], ii = A[8];
+      var A0 = e * ii - f * h, B0 = -(d * ii - f * g), C0 = d * h - e * g, det = a * A0 + b * B0 + cc * C0; if (Math.abs(det) < 1e-18) det = 1e-18;
+      return [A0 / det, -(b * ii - cc * h) / det, (b * f - cc * e) / det, B0 / det, (a * ii - cc * g) / det, -(a * f - cc * d) / det, C0 / det, -(a * h - b * g) / det, (a * e - b * d) / det];
+    }
+    var F = [1, -dt, 0, 0, 1, 0, 0, 0, 1], Ft = tr(F);
+    for (i = 0; i < n; i++) {
+      x = [x[0] + (P.lon[i] - x[1]) * dt, x[1], x[2]];
+      M = mul(mul(F, M), Ft); M[0] += Q[0]; M[4] += Q[1]; M[8] += Q[2];
+      for (k = 0; k < 3; k++) xp[3 * i + k] = x[k];
+      for (k = 0; k < 9; k++) Pp[9 * i + k] = M[k];
+      // measurement: lat = w v + bt. The turn rate w is itself noisy, and a noisy w on the right-hand side would pull
+      // v towards zero. So: where w is not clear of its own noise (a straight) it tells nothing about v, only about bt;
+      // elsewhere its noise is allowed for, in the value used and in how far the measurement is trusted.
+      var w = P.w[i], sw2 = P.sw * P.sw, use = Math.abs(w) >= 3 * P.sw, H0 = use ? w : 0, H2 = 1, wp = use ? w - sw2 / w : 0;
+      var PH = [M[0] * H0 + M[2] * H2, M[3] * H0 + M[5] * H2, M[6] * H0 + M[8] * H2];
+      var R = Math.pow(SPD.sl, 2) + Math.pow(0.3 * P.wd[i], 2) + sw2 * x[0] * x[0], S = H0 * PH[0] + H2 * PH[2] + R, inn = P.lat[i] - (wp * x[0] + x[2]);
+      var K0 = PH[0] / S, K1 = PH[1] / S, K2 = PH[2] / S;
+      x = [x[0] + K0 * inn, x[1] + K1 * inn, x[2] + K2 * inn];
+      var HP = [H0 * M[0] + H2 * M[6], H0 * M[1] + H2 * M[7], H0 * M[2] + H2 * M[8]], Kv = [K0, K1, K2], N = new Array(9);
+      for (r = 0; r < 3; r++) for (c = 0; c < 3; c++) N[r * 3 + c] = M[r * 3 + c] - Kv[r] * HP[c];
+      M = N; M[1] = M[3] = 0.5 * (M[1] + M[3]); M[2] = M[6] = 0.5 * (M[2] + M[6]); M[5] = M[7] = 0.5 * (M[5] + M[7]);
+      for (k = 0; k < 3; k++) xf[3 * i + k] = x[k];
+      for (k = 0; k < 9; k++) Pf[9 * i + k] = M[k];
+    }
+    var out = new Float32Array(n), sd = new Float32Array(n), xs = [0, 0, 0], Ps = new Array(9);
+    if (n) { for (k = 0; k < 3; k++) xs[k] = xf[3 * (n - 1) + k]; for (k = 0; k < 9; k++) Ps[k] = Pf[9 * (n - 1) + k]; out[n - 1] = Math.max(0, xs[0]); sd[n - 1] = Math.sqrt(Math.max(Ps[0], 0)); }
+    for (i = n - 2; i >= 0; i--) {
+      var Pfi = Array.prototype.slice.call(Pf, 9 * i, 9 * i + 9), Ppn = Array.prototype.slice.call(Pp, 9 * (i + 1), 9 * (i + 1) + 9);
+      var C = mul(mul(Pfi, Ft), inv(Ppn)), dx = [xs[0] - xp[3 * (i + 1)], xs[1] - xp[3 * (i + 1) + 1], xs[2] - xp[3 * (i + 1) + 2]], nx = [0, 0, 0];
+      for (r = 0; r < 3; r++) nx[r] = xf[3 * i + r] + C[r * 3] * dx[0] + C[r * 3 + 1] * dx[1] + C[r * 3 + 2] * dx[2];
+      var D = new Array(9); for (k = 0; k < 9; k++) D[k] = Ps[k] - Ppn[k];
+      var CD = mul(mul(C, D), tr(C)); for (k = 0; k < 9; k++) Ps[k] = Pfi[k] + CD[k];
+      xs = nx;
+      out[i] = Math.max(0, xs[0]); sd[i] = Math.sqrt(Math.max(Ps[0], 0));
+    }
+    return { v: out, sd: sd, flipped: P.flipped, bias: n ? [xf[3 * (n - 1) + 1], xf[3 * (n - 1) + 2]] : [0, 0], fs: fs };
+  }
+  /* From a recording to the three signals the speed estimate needs, at the working rate.
+     rec: flat array of rows, nc values each, as the app stores them:
+          [t, lin x y z, with-gravity x y z, rotation x y z, ...]
+     First the direction of the steering column in the phone's axes is found (mountAxis); then, sample by
+     sample, the turn rate and the forward and sideways forces are worked out with it.
+     Returns {yaw, lat, lon (arrays at fs), axis (or null), offSquare (deg), usable (share of samples with
+     a usable phone position), rate}. */
+  function motion(rec, nc, fs) {
+    fs = fs || FS;
+    var n = Math.floor(rec.length / nc), i, ws = [];
+    if (n < 2) return { yaw: [], lat: [], lon: [], axis: null, offSquare: 0, usable: 0, rate: 0 };
+    var rate = (n - 1) / Math.max(1e-6, rec[(n - 1) * nc] - rec[0]);
+    for (i = 0; i < n; i++) ws.push([rec[i * nc + 7], rec[i * nc + 8], rec[i * nc + 9]]);
+    var ma = mountAxis(ws, rate), c = ma ? ma.axis : null, off = c ? Math.acos(Math.min(1, c[2])) * 180 / Math.PI : 0;
+    // A phone on a wheel lies roughly in the wheel's plane. A "column" far from the phone's z axis is not one: it is
+    // vibration about one axis, or the kart's own turning seen by a phone on a fixed mount. Then z is used.
+    if (c && off > 35) { c = null; ma = null; off = 0; }
+    if (c && off < 2) c = null;                               // square on the wheel within the method's own precision
+    var sy = new Slots(fs), sa = new Slots(fs), so = new Slots(fs), ok = 0;
+    for (i = 0; i < n; i++) {
+      var o = i * nc, t = rec[o], lin = [rec[o + 1], rec[o + 2], rec[o + 3]];
+      var gx = rec[o + 4] - lin[0], gy = rec[o + 5] - lin[1], gz = rec[o + 6] - lin[2], gn = Math.sqrt(gx * gx + gy * gy + gz * gz) || 1, up = [gx / gn, gy / gn, gz / gn];
+      var f = kartForces(lin, up, c);
+      sy.push(t, turnRate(ws[i], up, c));
+      if (f) { ok++; sa.push(t, f[1]); so.push(t, f[0]); } else { sa.push(t, NaN); so.push(t, NaN); }
+    }
+    return { yaw: sy.v, lat: sa.v, lon: so.v, axis: c, offSquare: off, found: !!ma, usable: ok / n, rate: rate };
+  }
+
+  /* Distance covered between two times (s), from a speed trace at fs. */
+  function distanceBetween(v, t0, t1, fs) {
+    fs = fs || FS;
+    var a = Math.max(0, t0 * fs - 0.5), b = Math.min(v.length - 1, t1 * fs - 0.5), s = 0, i0 = Math.ceil(a), i1 = Math.floor(b), i;   // sample i sits at (i + 0.5)/fs
+    if (b <= a) return 0;
+    for (i = i0; i < i1; i++) s += 0.5 * (v[i] + v[i + 1]) / fs;
+    if (i0 > a && i0 <= i1) s += (i0 - a) * v[Math.max(0, i0 - 1)] / fs * 0.5 + (i0 - a) * v[i0] / fs * 0.5;
+    if (i1 < b && i1 >= i0) s += (b - i1) * v[i1] / fs * 0.5 + (b - i1) * v[Math.min(v.length - 1, i1 + 1)] / fs * 0.5;
+    return s;
   }
 
   /* ---------------------------------------------------------------- lap detector */
@@ -559,7 +759,7 @@
   /* The reference lap for the tracker: the smoothed signal from its exact start, one value per working sample. */
   function referenceLap(sm, start, end, fs) { fs = fs || FS; var n = Math.max(2, Math.round((end - start) * fs)), out = new Float32Array(n); for (var i = 0; i < n; i++) out[i] = valueAt(sm, start + i / fs, fs); return out; }
 
-  var api = { FS: FS, turnRate: turnRate, LapDetector: LapDetector, lapsFromMarks: lapsFromMarks, lapSignal: lapSignal, alignLaps: alignLaps,
+  var api = { FS: FS, turnRate: turnRate, mountAxis: mountAxis, kartForces: kartForces, Slots: Slots, motion: motion, estimateSpeed: estimateSpeed, distanceBetween: distanceBetween, SPD: SPD, LapDetector: LapDetector, lapsFromMarks: lapsFromMarks, lapSignal: lapSignal, alignLaps: alignLaps,
               findCorners: findCorners, cornerTimes: cornerTimes, median: median, LiveTracker: LiveTracker, lapSignalFine: lapSignalFine, valueAt: valueAt, referenceLap: referenceLap };
   if (typeof module !== "undefined" && module.exports) module.exports = api; else root.KartCore = api;
 })(typeof self !== "undefined" ? self : this);
