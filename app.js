@@ -1,7 +1,7 @@
 /* app.js -- Apex Trace Kart 2: screens, sensors and storage. The measuring is in core.js. */
 (function () {
   "use strict";
-  const K = window.KartCore, VERSION = "2.2.0", G0 = 9.80665;
+  const K = window.KartCore, VERSION = "2.3.0", G0 = 9.80665;
   const $ = (s, r) => (r || document).querySelector(s), $$ = (s, r) => Array.from((r || document).querySelectorAll(s));
   const esc = s => String(s === null || s === undefined ? "" : s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
   const app = $("#app");
@@ -124,7 +124,7 @@
   /* Which timing drives the dash right now. With automatic timing, the driver's own taps stand in until
      the lap has been found (2 to 3 laps on a normal track, minutes on a track that crosses over itself). */
   function liveSource(s) { return s.source === "taps" || (s.det.state() === "learning" && s.marks.length >= 1) ? "taps" : "auto"; }
-  function currentLaps(s) { return liveSource(s) === "taps" ? K.lapsFromMarks(s.marks) : s.det.laps(); }
+  function currentLaps(s) { const laps = liveSource(s) === "taps" ? K.lapsFromMarks(s.marks) : s.det.laps(); return laps.map(l => s.det.hasGap(l.start, l.end) ? Object.assign({}, l, { interrupted: true, reason: "sensor gap" }) : l); }
   function lastPass(s) { return liveSource(s) === "taps" ? (s.marks.length ? s.marks[s.marks.length - 1] : null) : s.det.lastPass(); }
   function passCount(s) { return liveSource(s) === "taps" ? s.marks.length : s.det.passes.length; }
 
@@ -146,8 +146,9 @@
       while (s.trkAnchor + (s.trk.k + 1) / fs <= usable && guard++ < 4000) s.trk.push(K.valueAt(sm, s.trkAnchor + (s.trk.k + 1) / fs, fs));
       const behind = t - (s.trkAnchor + s.trk.k / fs);                // the tracker runs a third of a second behind the clock
       m.delta = s.trk.delta(); m.pred = best.time + m.delta;
-      m.lapClock = s.trk.lapClock() + behind;                         // restarts at the line at once, without waiting for the pass to be confirmed
-      if (s.trk.lap > 0) m.lapN = laps.length + 1 + s.trk.lap;
+      // Pattern tracker may estimate delta but cannot reset the confirmed lap clock.
+      // m.lapClock = s.trk.lapClock() + behind;                         // restarts at the line at once, without waiting for the pass to be confirmed
+      if (s.trk.lap > 0 || !s.hasGyro || t - s.tS > 0.5) { m.delta = null; m.pred = null; }
     }
     return m;
   }
@@ -306,8 +307,9 @@
         // gets its own time on the session's clock, however late or bunched it arrives.
         const arrive = (performance.now() - s.t0) / 1000, made = p.timestamp ? (p.timestamp - s.started) / 1000 : null;
         let t = arrive;
-        if (made !== null && isFinite(made) && Math.abs(arrive - made) < 86400) { const d = arrive - made; if (s.locClock === undefined || d < s.locClock) s.locClock = d; t = Math.max(0, Math.min(arrive, made + s.locClock)); }
-        s.loc.push([+t.toFixed(2), n(c.latitude), n(c.longitude), n(c.accuracy), n(c.speed), n(c.heading)]);
+        if (made !== null && isFinite(made) && made >= 0 && made <= arrive + 0.25) t = made;
+        else { note(s, "location timestamp incompatible with session clock; fix excluded"); return; }
+        s.loc.push([t, n(c.latitude), n(c.longitude), n(c.accuracy), n(c.speed), n(c.heading)]);
         // a track made with GPS is selected: is this the line?
         if (s.gps) { try { const tc = s.gps.push(t, n(c.latitude), n(c.longitude), n(c.accuracy), n(c.speed)); if (tc !== null) gpsMark(s, tc); } catch (e) { s.errs++; } }
       }, e => { if (cur === s && !s.locNoted && e && e.code !== 3) { s.locNoted = true; if (e.code === 1) s.locOff = true; note(s, "location not available (" + (e.message || e.code) + ")"); } },
@@ -399,7 +401,7 @@
       s.lastLapN = m.laps.length; s.gLapMax = s.gS;
       $$('[data-tile="last"]').forEach(c => { c.classList.remove("flash"); void c.offsetWidth; c.classList.add("flash"); });
     }
-    if (m.state === "learning") m.learn = Math.min(0.97, Math.abs(s.det.y.reduce((a, b) => a + b, 0)) / K.FS / 360 / 2.4);
+    if (m.state === "learning") m.learn = Math.min(0.9, s.det.duration() / 120);
     const live = !s.sim;
     if (m.state === "error" || (s.errAt !== undefined && s.t - s.errAt < 5)) m.status = "Lap timing hit a problem. Still recording.";
     else if (live && !s.gps && s.t > 3 && s.events === 0) m.status = "No motion data from this phone";
@@ -407,13 +409,13 @@
     else if (live && s.t > 3 && !s.hasGyro && s.source === "auto") m.status = "No turn sensor: tap at the line";
     else if (live && s.t > 2 && s.t < 25 && s.wake !== "held") m.status = "Screen may switch off: battery saver?";
     else if (m.standIn) m.status = "Timing from your taps while the track is learnt";
-    else if (m.state === "learning") m.status = s.t < 20 ? "Lap times appear after 2 to 3 laps" : s.t < 150 ? "Finding the lap. Tap at the line for times now" : "Lap not found yet. Tap at the line for times";
+    else if (m.state === "learning") m.status = s.t < 20 ? "Learning repeated laps; accuracy unvalidated" : s.t < 150 ? "Finding the lap. Tap at the line for times now" : "Lap not found yet. Tap at the line for times";
     else if (s.gps && s.locOff) m.status = "Location is not allowed: tap at the line";
     else if (s.gps && !m.gpsOk) m.status = s.gps.lastT === null ? "Waiting for GPS. Tap at the line meanwhile" : s.t - s.gps.lastT > 5 ? "GPS lost. Tap at the line" : "GPS too weak (±" + (m.gpsAcc === null ? "?" : m.gpsAcc.toFixed(0)) + " m). Tap at the line";
     else if (s.gps && !s.marks.length) m.status = "GPS ready (±" + m.gpsAcc.toFixed(0) + " m). Timing starts at the line";
     else if (s.gps) m.status = "Laps by GPS (±" + m.gpsAcc.toFixed(0) + " m)  ·  " + clock(s.t);
     else if (m.state === "taps" && !s.marks.length) m.status = "Tap anywhere as you cross the line";
-    else m.status = (m.source === "taps" ? "Laps by your taps" : "Automatic laps") + "  ·  " + clock(s.t);
+    else m.status = (m.source === "taps" ? "Laps by your taps" : "Virtual-point laps") + "  ·  " + clock(s.t);
     try { refresh(m); } catch (e) { s.errs++; if (s.errs <= 5) note(s, "screen error: " + (e && e.message)); }
   }
 
@@ -434,18 +436,19 @@
     // taps and GPS say which lap, to a few tenths; the turn pattern around the line then places each pass finely
     let used = s.marks.slice(), sharp = null;
     // (only once the session is over: it takes a moment, and nothing may hold up the recording while driving)
-    if (final) { try { const rm = K.refineMarks(s.det.y, s.marks, K.FS); used = rm.marks; sharp = { moved: rm.moved, shift: +rm.shift.toFixed(3) }; } catch (e) { used = s.marks.slice(); } }
-    try { taps = K.lapsFromMarks(used); } catch (e) { taps = []; }
+    if (final) { try { const rm = K.refineMarks(s.det.y, s.marks, K.FS); sharp = { moved: rm.moved, shift: +rm.shift.toFixed(3), candidateMarks: rm.marks, applied: false }; } catch (e) { used = s.marks.slice(); } }
+    try { taps = K.lapsFromMarks(used).map(l => s.det.hasGap(l.start, l.end) ? Object.assign({}, l, { interrupted: true, reason: "sensor gap" }) : l); } catch (e) { taps = []; }
     // the automatic timing found nothing but the driver tapped: the taps are the lap times
     const fallback = s.source === "auto" && auto.length < 1 && taps.length >= 1, source = s.source === "taps" || fallback ? "taps" : "auto", laps = source === "taps" ? taps : auto;
     const meta = summary(s, laps, source);
     meta.trackLength = s.trackLength || 0;
+    meta.sensorSchema = 3; meta.gyroAxes = "xyz: beta,gamma,alpha"; meta.accuracyValidated = false;
     meta.sharp = sharp; if (s.gpsTrack) meta.gps = { track: s.gpsTrack.name, line: s.gpsTrack.line, length: s.gpsTrack.length, marks: s.gpsMarks };
     meta.fallback = fallback; meta.open = !final;                         // open: the session was not stopped (the app was closed, or it is still running)
     try { meta.detector = { state: s.det.state(), lapLength: s.det.period ? s.det.period / K.FS : null, method: s.det.method, quality: s.det.quality, relearned: s.det.relearned || 0 }; } catch (e) { meta.detector = { state: "error" }; }
     const ab = new Uint8Array(s.audio.bins.length * NB); s.audio.bins.forEach((row, i) => ab.set(row, i * NB));
     const data = { id: s.id, rec: s.rec.data(), nc: COLS.length, y20: Float32Array.from(s.det.y), marks: s.marks.slice(), marksUsed: used, autoLaps: auto, tapLaps: taps,
-                   audioT: Float32Array.from(s.audio.t), audioBins: ab, nb: NB, loc: s.loc.slice() };
+                   audioT: Float32Array.from(s.audio.t), audioBins: ab, nb: NB, loc: s.loc.slice(), sensorSchema: 3 };
     // the measurements first: a session listed without its data would be worse than one not listed
     let ok = await Store.put("data", data);
     if (!ok && ab.length) ok = await Store.put("data", Object.assign({}, data, { audioT: new Float32Array(0), audioBins: new Uint8Array(0) }));   // short of space: drop the sound picture, keep the rest
@@ -518,7 +521,7 @@
      about the phone's x, y, z in deg/s. All in the phone's own axes (x to the right of the screen, y to its
      top, z out of it). */
   function sample(t, a, g, r) {
-    const s = cur; if (!s) return;
+    const s = cur; if (!s || !Number.isFinite(t) || t < 0 || (s.events > 0 && t <= s.tS)) return;
     let grav, lin;
     if (a) { grav = [g[0] - a[0], g[1] - a[1], g[2] - a[2]]; lin = a; s.hasLin = true; }
     else {
@@ -543,16 +546,17 @@
     if (s.gS > s.gLapMax) s.gLapMax = s.gS;
     if (s.gS > s.gMax) s.gMax = s.gS;
     s.rec.push([t, lin[0], lin[1], lin[2], g[0], g[1], g[2], w[0], w[1], w[2], yaw, gH, steer]);   // the recording first: it must survive anything below
-    try { s.det.push(t, yaw); } catch (e) { s.errs++; }
+    try { if (r) s.det.push(t, yaw); } catch (e) { s.errs++; }
   }
 
   function onMotion(e) {
     if (!cur || cur.sim || cur.ending) return;
     const g = e.accelerationIncludingGravity, a = e.acceleration, r = e.rotationRate;
-    if (!g || g.x === null || g.x === undefined) return;
-    const t = (performance.now() - cur.t0) / 1000;
-    sample(t, a && a.x !== null && a.x !== undefined ? [a.x, a.y, a.z] : null, [g.x, g.y, g.z],
-           r && r.alpha !== null && r.alpha !== undefined ? [r.alpha || 0, r.beta || 0, r.gamma || 0] : null);     // alpha, beta, gamma = about the phone's x, y, z
+    if (!g || ![g.x, g.y, g.z].every(Number.isFinite)) return;
+    const stamp = e.timeStamp, now = performance.now();
+    const t = ((Number.isFinite(stamp) && stamp >= cur.t0 && stamp <= now + 10 ? stamp : now) - cur.t0) / 1000;
+    sample(t, a && [a.x, a.y, a.z].every(Number.isFinite) ? [a.x, a.y, a.z] : null, [g.x, g.y, g.z],
+           K.browserRotation(r));     // beta=X, gamma=Y, alpha=Z per W3C
   }
 
   /* Engine sound: a compact picture of the sound spectrum ten times a second (not a recording of voices).
@@ -602,7 +606,7 @@
       <div class="top"><div class="mark">${MARK}Apex Trace Kart <small>${VERSION}</small></div></div>
       <div class="card">
         <div class="field" style="margin-top:0"><label for="track">Track</label><input type="text" id="track" value="${esc(settings.track)}" placeholder="Name of the track" autocomplete="off" maxlength="40"></div>
-        <div class="field"><label for="tlen">Length of the track in metres, if you know it (makes speed and distance more accurate)</label><input type="number" id="tlen" min="0" max="5000" step="1" inputmode="numeric" placeholder="not known" value="${Number(settings.trackLength) > 0 ? Number(settings.trackLength) : ""}"></div>
+        <div class="field"><label for="tlen">Length of the track in metres, if you know it (calibrates the estimated scale; does not validate it)</label><input type="number" id="tlen" min="0" max="5000" step="1" inputmode="numeric" placeholder="not known" value="${Number(settings.trackLength) > 0 ? Number(settings.trackLength) : ""}"></div>
         <div class="lbl" style="margin:14px 0 6px">Tracks made with GPS</div>
         <div class="chips">${tracks.map(t => `<button type="button" class="chip" data-trk="${esc(t.id)}" aria-pressed="${t.id === settings.trackId}">${esc(t.name)} <small>${t.length ? Math.round(t.length) + " m" : ""}</small></button>`).join("")}<button type="button" class="chip add" id="mktrack">+ Create a track</button></div>
         <div id="gpsbox" ${settings.trackId ? "" : "hidden"}>
@@ -620,7 +624,7 @@
         <div style="min-width:0"><b>Dashboard</b><div class="small">Big: ${esc(fname(settings.dash.main))}. Tiles: ${settings.dash.tiles.length ? esc(settings.dash.tiles.map(fname).join(", ")) : "none"}.</div></div>
         <button class="btn" id="setup" type="button">Set up</button>
       </div>
-      <div class="row" style="margin-top:14px"><button class="btn" id="simdrive" type="button">Watch a simulated drive</button><button class="btn" id="demo" type="button">Open a demo session</button><button class="btn" id="check" type="button">Check this phone</button></div>
+      <div class="row" style="margin-top:14px"><button class="btn" id="simdrive" type="button">Watch a simulated drive</button><button class="btn" id="demo" type="button">Open a demo session</button><button class="btn" id="check" type="button">Check this phone</button><a class="btn" href="validation.html">Private validation</a></div>
       <h2>Sessions</h2>
       ${sessions.length ? `<ul class="sessions">${sessions.map(s => `<li><button type="button" data-open="${esc(s.id)}"><span class="t">${esc(s.track)}</span>
         <span class="b"><b>${lapTime(s.best)}</b><span>best of ${s.nLaps} lap${s.nLaps === 1 ? "" : "s"}</span></span>
@@ -628,7 +632,7 @@
         : `<p class="sub">No session yet. Every session you drive is kept on this phone and listed here.</p>`}
       <p class="small" id="offline" style="margin-top:26px"></p>
     </div>`;
-    const note = () => { $("#srcnote").textContent = settings.source === "auto" ? "Laps are found from the way the kart turns. Lap times appear after 2 to 3 laps and include the laps already driven. If you also tap the screen at the line, you get times from the first lap, and your taps are kept as a second set of lap times." : "Tap anywhere on the screen each time you cross the line."; };
+    const note = () => { $("#srcnote").textContent = settings.source === "auto" ? "Laps are found from the way the kart turns. Learning repeated laps; accuracy unvalidated and include the laps already driven. If you also tap the screen at the line, you get times from the first lap, and your taps are kept as a second set of lap times." : "Tap anywhere on the screen each time you cross the line."; };
     note();
     $("#track").addEventListener("input", e => {
       settings.track = e.target.value; if (settings.trackLength) { settings.trackLength = 0; $("#tlen").value = ""; }
@@ -695,7 +699,7 @@
       else {
         const acc = fix.acc; ok = acc <= 20;
         a.textContent = "GPS accuracy: within " + acc.toFixed(0) + " m";
-        sub.textContent = acc <= 6 ? "Good. Lap times will be within a few tenths of a second." : acc <= 12 ? "Usable. Lap times will be rough (several tenths of a second)." : acc <= 20 ? "Weak. Laps should be counted, but times can be a second out." : "Not good enough to time laps here. Under a roof this is normal: the phone cannot see the satellites.";
+        sub.textContent = acc <= 6 ? "Good reported position quality. Timing accuracy still requires independent validation." : acc <= 12 ? "Position may be usable. A timing error cannot be inferred from this accuracy value alone." : acc <= 20 ? "Weak position quality; false or missed crossings are possible." : "Not good enough to time laps here. Under a roof this is normal: the phone cannot see the satellites.";
         cls = acc <= 6 ? "good" : acc <= 20 ? "" : "bad";
       }
       box.className = "gpsline " + cls;
@@ -805,9 +809,9 @@
     (async () => { if (!("wakeLock" in navigator)) { st.wake = "none"; return; } try { const w = await navigator.wakeLock.request("screen"); st.wake = "ok"; setTimeout(() => { try { w.release(); } catch (e) { /* gone */ } }, 1500); } catch (e) { st.wake = "refused"; } })();
     const h = e => {
       const g = e.accelerationIncludingGravity, a = e.acceleration, r = e.rotationRate; if (!g || g.x === null) return;
-      st.n++; if (a && a.x !== null && a.x !== undefined) st.lin = true; if (r && r.alpha !== null && r.alpha !== undefined) st.gyro = true;
-      if (st.lin && st.gyro) {
-        const gr = [g.x - a.x, g.y - a.y, g.z - a.z], n = Math.hypot(...gr) || 1, up = gr.map(x => x / n), w = [r.alpha || 0, r.beta || 0, r.gamma || 0];
+      st.n++; if (a && a.x !== null && a.x !== undefined) st.lin = true; if (K.browserRotation(r)) st.gyro = true;
+      if (a && [a.x,a.y,a.z].every(Number.isFinite) && K.browserRotation(r)) {
+        const gr = [g.x - a.x, g.y - a.y, g.z - a.z], n = Math.hypot(...gr) || 1, up = gr.map(x => x / n), w = K.browserRotation(r);
         st.yaw = K.turnRate(w, up);
         const now = performance.now(); if (st.last && now - st.last < 500) st.head += st.yaw * (now - st.last) / 1000; st.last = now;
         const v = a.x * up[0] + a.y * up[1] + a.z * up[2]; st.g = Math.hypot(a.x - v * up[0], a.y - v * up[1], a.z - v * up[2]) / G0;
@@ -967,17 +971,20 @@
     const nc = data.nc, rec = data.rec, n = rec.length / nc, out = [], sn = meta.sensors || {};
     out.push(`# Apex Trace Kart ${meta.version || VERSION}`, `# Track,${JSON.stringify(meta.track)}`, `# Started,${new Date(meta.started).toISOString()}`, `# Lap timing,${meta.source}`,
       `# ${meta.gps ? "Passes of the line by GPS and taps" : "Taps"} (s),${data.marks.map(x => x.toFixed(3)).join(" ")}`,
-      ...(data.marksUsed ? [`# The same after placing them with the turn pattern (s),${data.marksUsed.map(x => x.toFixed(3)).join(" ")}`] : []),
+      ...(data.marksUsed ? [`# Line marks used (s),${data.marksUsed.map(x => x.toFixed(3)).join(" ")}`] : []),
       ...(meta.gps ? [`# GPS track,${JSON.stringify(meta.gps.track)},line lat ${meta.gps.line.lat} lon ${meta.gps.line.lon} direction ${Number(meta.gps.line.dir).toFixed(1)} deg half width ${meta.gps.line.half || 12} m,length ${Math.round(meta.gps.length || 0)} m,passes seen by GPS ${meta.gps.marks}`] : []), `# Automatic lap starts (s),${(data.autoLaps || []).map(l => l.start.toFixed(3)).concat((data.autoLaps || []).slice(-1).map(l => l.end.toFixed(3))).join(" ")}`,
       `# Sensors,${(sn.rate || 0).toFixed(1)} per second; turn sensor ${sn.gyro ? "yes" : "no"}; gravity removed by phone ${sn.linear ? "yes" : "no"}; silences ${sn.gaps || 0} (${sn.gapTime || 0} s); screen lock ${sn.screen || "?"}; errors ${sn.errors || 0}; stopped properly ${meta.open ? "no" : "yes"}`,
       `# Phone,${JSON.stringify(navigator.userAgent)}`,
       ...(meta.log || []).map(l => `# Log,${l[0]},${JSON.stringify(l[1])}`),
+      `# Sensor schema,${meta.sensorSchema || 2}`,
+      `# Accuracy validated,false`,
+      `# Timing basis,${meta.source === "auto" ? "virtual motion-pattern point" : "physical-line marks: GPS or taps"}`,
       `# Track length given (m),${meta.trackLength || ""}`,
       ...((data.loc || []).length ? ["# Location fixes: time s, latitude, longitude, accuracy m, GPS speed m/s, heading deg"] : []),
       ...(data.loc || []).map(p => "# Loc," + p.map(x => x === null ? "" : x).join(",")),
       "# Columns: time s; acceleration without gravity m/s2 (phone axes x y z); acceleration with gravity m/s2; rotation rate deg/s about x y z; turn rate of the kart deg/s (rotation about the vertical, the wheel's own rotation removed); horizontal force G; wheel angle estimate deg",
       "time,acc_x,acc_y,acc_z,accg_x,accg_y,accg_z,rot_x,rot_y,rot_z,turn_rate,g_horizontal,wheel_angle");
-    const d = [3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 3, 1];
+    const d = [6, 5, 5, 5, 5, 5, 5, 4, 4, 4, 4, 5, 4];
     for (let i = 0; i < n; i++) { const r = []; for (let c = 0; c < nc; c++) r.push(rec[i * nc + c].toFixed(d[c])); out.push(r.join(",")); }
     return out.join("\n") + "\n";
   }
@@ -1007,7 +1014,12 @@
     if (speedCache && speedCache.key === key) return speedCache.sp;
     let sp;
     try {
-      const mo = K.motion(data.rec, data.nc);
+      let rows = data.rec;
+      if (!meta.demo && meta.sensorSchema !== 3 && rows && rows.length && data.nc >= 10) {
+        rows = Array.from(rows);
+        for (let i = 0; i < rows.length; i += data.nc) { const z = rows[i + 7], x = rows[i + 8], y = rows[i + 9]; rows[i + 7] = x; rows[i + 8] = y; rows[i + 9] = z; }
+      }
+      const mo = K.motion(rows, data.nc);
       // where the phone's GPS followed the laps, its speed is a measurement and replaces the estimate
       const okL = laps.filter(l => !l.interrupted), n20 = Math.max(mo.yaw.length, Math.ceil((meta.duration || 0) * K.FS));
       const g = okL.length && n20 > 0 ? K.gpsSpeed(data.loc, n20, okL[0].start, okL[okL.length - 1].end) : null;
@@ -1049,6 +1061,7 @@
     const row = a => out.push(a.map(q).join(","));
     row(["Format", "MoTeC CSV File", "", "", "Workbook", ""]); row(["Venue", meta.track, "", "", "Worksheet", ""]); row(["Vehicle", "Kart", "", "", "Vehicle Desc", ""]);
     row(["Driver", "", "", "", "Engine ID", ""]); row(["Device", "Apex Trace Kart " + (meta.version || VERSION) + " (phone)"]);
+    row(["Accuracy validated", "false"]); row(["Speed provenance", sp.measured ? sp.measured.speedSource : "inertial model estimate"]); row(["Timing basis", meta.source === "auto" ? "virtual motion-pattern point" : "recorded physical-line marks"]);
     row(["Comment", sp.measured ? "Speed from the phone's GPS (about one position a second). Forces and turn rate from the phone's motion sensors. No pedals." : "Speed and distance are ESTIMATES from the phone's motion sensors" + (sp.scaled ? ", scaled to a track length of " + meta.trackLength + " m" : "") + ". No pedals, no GPS.", "", "", "Session", "Kart"]);
     row(["Log Date", `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()}`, "", "", "Origin Time", "0.000", "s"]); row(["Log Time", `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`, "", "", "Start Time", "0.000", "s"]);
     row(["Sample Rate", fs.toFixed(3), "Hz", "", "End Time", (n / fs).toFixed(3), "s"]); row(["Duration", (n / fs).toFixed(3), "s", "", "Start Distance", "0", "m"]); row(["Range", "entire outing", "", "", "End Distance", "", "m"]);
@@ -1086,7 +1099,7 @@
     const meta = await Store.get("sessions", id), data = await Store.get("data", id);
     if (!meta || !data) { toast("That session is no longer on this phone."); return viewHome(); }
     const source = opts.source || meta.source, laps = (source === "taps" ? data.tapLaps : data.autoLaps) || [], ok = laps.filter(l => !l.interrupted);
-    const head = headHtml(meta), foot = footHtml(meta);
+    const head = headHtml(meta) + `<div class="note" style="margin-top:12px"><b>${meta.demo ? "Simulation" : "Development recording"}</b> · ${source === "auto" ? "Virtual motion-pattern timing point" : "Recorded line marks"}. ${meta.demo ? "Synthetic results do not establish real-track accuracy." : "Timing accuracy has not been independently established. Distance and corner analysis from motion are estimates."} <a href="validation.html">Replay and check against independent timing</a>${!meta.demo && meta.sensorSchema !== 3 ? "<br>Legacy session: gyro fields were stored in the wrong axis order. Raw-axis replay can repair the signal; stored lap boundaries remain the original results." : ""}</div>`, foot = footHtml(meta);
     if (ok.length < 2) {
       app.innerHTML = `<div class="page">${head}
         <div class="note">${laps.length < 1 ? (source === "taps" ? (meta.gps ? "The GPS did not see two passes of the start/finish line in this session, so there is no lap to show. Look at the location line below: it says how good the phone's position was." : "Fewer than two taps were recorded, so there is no lap to show.") :
@@ -1102,7 +1115,7 @@
     const times = ok.map(l => l.time), mean = times.reduce((a, b) => a + b, 0) / times.length, sd = Math.sqrt(times.reduce((a, b) => a + (b - mean) * (b - mean), 0) / times.length);
     const sp = speedOf(meta, data, laps, source), hasSp = !!sp.v;
     // a phone that is not square on the wheel: its turn rate is worked out again with the column's real direction
-    const y20 = hasSp && sp.mo.axis && sp.mo.yaw.length >= data.y20.length - 4 ? sp.mo.yaw : data.y20;
+    const y20 = hasSp && sp.mo.yaw.length >= data.y20.length - 4 ? sp.mo.yaw : data.y20;
     const ctKey = id + "|" + source + "|" + bestI + "|" + ok.length + "|" + y20.length + "|" + (y20 === data.y20 ? "z" : "c");
     if (!ctCache || ctCache.key !== ctKey) ctCache = { key: ctKey, ct: K.cornerTimes(y20, ok, bestI) };
     const ct = ctCache.ct, nC = ct.corners.length, rows = ct.table.map(r => r || new Array(nC).fill(NaN));
@@ -1136,16 +1149,16 @@
       <h2 id="spd">Speed and distance <small class="est">GPS</small></h2>
       <div class="kpis">
         <div class="kpi"><div class="k">Top speed, best lap</div><div class="v">${topOf(best).toFixed(0)} <small>km/h</small></div><div class="s">${esc(selName.toLowerCase())}: ${topOf(ok[sel]).toFixed(0)} km/h</div></div>
-        <div class="kpi"><div class="k">Lap length</div><div class="v">${sp.len.toFixed(0)} <small>m</small></div><div class="s">measured by GPS, typical lap</div></div>
+        <div class="kpi"><div class="k">Lap length</div><div class="v">${sp.len.toFixed(0)} <small>m</small></div><div class="s">integrated speed estimate, typical lap</div></div>
       </div>
-      <p class="small" style="margin-top:8px">Measured by the phone's GPS: ${sp.measured.n} positions on the timed laps, one every ${sp.measured.every.toFixed(1)} s, accuracy ${sp.measured.acc === null ? "not given" : sp.measured.acc.toFixed(0) + " m"} as claimed by the phone. A phone gives about one position a second, so the trace is smooth: something that lasts a few tenths of a second (a short lift, a late stab on the brake) does not show fully, and the slowest point of a tight turn reads a little high.</p>`
+      <p class="small" style="margin-top:8px">${sp.measured.derivedCount ? "Includes speed calculated from position differences; this is a derived estimate." : "Uses the phone location provider's reported speed, interpolated between fixes."} ${sp.measured.n} positions on the timed laps, one every ${sp.measured.every.toFixed(1)} s, accuracy ${sp.measured.acc === null ? "not given" : sp.measured.acc.toFixed(0) + " m"} as claimed by the phone. A phone gives about one position a second, so the trace is smooth: something that lasts a few tenths of a second (a short lift, a late stab on the brake) does not show fully, and short events or the slowest point of a tight turn may be distorted.</p>`
     : hasSp ? `
       <h2 id="spd">Speed and distance <small class="est">estimated</small></h2>
       <div class="kpis">
         <div class="kpi"><div class="k">Top speed, best lap</div><div class="v">${topOf(best).toFixed(0)} <small>km/h</small></div><div class="s">${esc(selName.toLowerCase())}: ${topOf(ok[sel]).toFixed(0)} km/h</div></div>
         <div class="kpi"><div class="k">Lap length</div><div class="v">${sp.len.toFixed(0)} <small>m</small></div><div class="s">${sp.scaled ? `set by you (the sensors alone gave ${sp.rawLen.toFixed(0)} m)` : "worked out from the sensors"}</div></div>
       </div>
-      <p class="small" style="margin-top:8px">Worked out from the phone's motion sensors: in a turn, speed is the sideways force divided by how fast the kart turns; between turns the forward force carries it along. <b>It has not yet been checked against a real measurement of a kart's speed.</b> The difference between two of your laps is more reliable than the figures themselves.${sp.mo.axis ? ` The phone was found to sit ${sp.mo.offSquare.toFixed(0)}° off square on the wheel, and this is allowed for.` : ""}${sp.gps ? ` Against the phone's GPS speed (${sp.gps.n} good fixes): the estimate is typically ${(100 * sp.gps.typical).toFixed(0)}% away, and ${(100 * Math.abs(sp.gps.ratio - 1)).toFixed(0)}% ${sp.gps.ratio > 1 ? "high" : "low"} overall.` : ""}</p>
+      <p class="small" style="margin-top:8px">Worked out from the phone's motion sensors: in a turn, speed is the sideways force divided by how fast the kart turns; between turns the forward force carries it along. <b>It has not yet been checked against a real measurement of a kart's speed.</b> Relative differences are also estimates and need independent validation.${sp.mo.axis ? ` The phone was found to sit ${sp.mo.offSquare.toFixed(0)}° off square on the wheel, and this is allowed for.` : ""}${sp.gps ? ` Against the phone's GPS speed (${sp.gps.n} good fixes): the estimate is typically ${(100 * sp.gps.typical).toFixed(0)}% away, and ${(100 * Math.abs(sp.gps.ratio - 1)).toFixed(0)}% ${sp.gps.ratio > 1 ? "high" : "low"} overall.` : ""}</p>
       ${sp.refused ? `<p class="small" style="color:var(--slower)">The track length you gave (${Number(meta.trackLength).toFixed(0)} m) is too far from what the sensors found (${sp.rawLen.toFixed(0)} m) to be used. Check it.</p>` : ""}
       <div class="field" style="max-width:420px"><label for="tl2">Length of the track in metres, if you know it: the speed is then scaled so that a lap is that long</label><div class="row" style="margin:0"><input type="number" id="tl2" min="0" max="5000" step="1" inputmode="numeric" placeholder="not known" value="${Number(meta.trackLength) > 0 ? Number(meta.trackLength) : ""}" style="max-width:160px"><button class="btn" id="tl2ok" type="button">Apply</button></div></div>`
       : `<h2 id="spd">Speed and distance</h2><p class="sub">${esc(sp.why || "Not available for this session.")}</p>`;
@@ -1153,14 +1166,14 @@
     let hmax = 0.15; rows.forEach(r => r.forEach((v, c) => { if (isFinite(v)) hmax = Math.max(hmax, v - cornerBest[c]); }));
     const heat = `<table><thead><tr><th></th>${ct.corners.map((c, k) => `<th>T${k + 1}</th>`).join("")}</tr></thead><tbody>${ok.map((l, i) => `<tr><th>Lap ${l.n}</th>${rows[i].map((v, c) => {
       const x = v - cornerBest[c], t = x / hmax; return isFinite(x) ? `<td class="${t < 0.45 ? "dim" : ""}" style="background:${ramp(t)}" title="Lap ${l.n}, turn ${c + 1}: ${x.toFixed(2)} s over the best">${x >= 0.05 ? x.toFixed(2).replace(/^0/, "") : ""}</td>` : "<td></td>"; }).join("")}</tr>`).join("")}</tbody></table>`;
-    const tapsNote = data.marks.length >= 2 ? `<p class="small" style="margin-top:8px">${source === "taps" ? (meta.gps && meta.gps.marks ? `Laps timed by GPS at the start/finish line of this track (${meta.gps.marks} passes seen by GPS${data.marks.length > meta.gps.marks ? ", " + (data.marks.length - meta.gps.marks) + " by your taps" : ""}).` : meta.fallback && !opts.source ? `The automatic timing did not find the lap in this session, so these are the laps from your ${data.marks.length} taps.` : `Laps from your ${data.marks.length} taps.`) + (meta.sharp && meta.sharp.moved ? ` Each pass was then placed more finely from the way the kart turns around the line (moved by ${meta.sharp.shift.toFixed(2)} s typically).` : "") : meta.gps ? `The GPS also saw ${data.marks.length} passes of the line.` : `You also tapped the screen ${data.marks.length} times.`}
+    const tapsNote = data.marks.length >= 2 ? `<p class="small" style="margin-top:8px">${source === "taps" ? (meta.gps && meta.gps.marks ? `Laps timed by GPS at the start/finish line of this track (${meta.gps.marks} passes seen by GPS${data.marks.length > meta.gps.marks ? ", " + (data.marks.length - meta.gps.marks) + " by your taps" : ""}).` : meta.fallback && !opts.source ? `The automatic timing did not find the lap in this session, so these are the laps from your ${data.marks.length} taps.` : `Laps from your ${data.marks.length} taps.`) + (meta.sharp && meta.sharp.applied && meta.sharp.moved ? ` Each pass was then placed more finely from the way the kart turns around the line (moved by ${meta.sharp.shift.toFixed(2)} s typically).` : "") : meta.gps ? `The GPS also saw ${data.marks.length} passes of the line.` : `You also tapped the screen ${data.marks.length} times.`}
       ${data.autoLaps.length >= 2 ? `<button class="btn" id="swap" type="button" style="margin-left:6px">${source === "taps" ? "Use automatic timing" : meta.gps ? "Use GPS timing" : "Use my taps"}</button>` : ""}</p>` : "";
     app.innerHTML = `<div class="page">${head}
       <div class="kpis">
         <div class="kpi"><div class="k">Best lap</div><div class="v c-best">${lapTime(best.time)}</div><div class="s">lap ${best.n} of ${laps.length}</div></div>
         <div class="kpi"><div class="k">Average lap</div><div class="v">${lapTime(mean)}</div><div class="s">${ok.length} complete laps</div></div>
         <div class="kpi"><div class="k">Consistency</div><div class="v">${sd.toFixed(2)} s</div><div class="s">typical gap between your laps</div></div>
-        <div class="kpi"><div class="k">Best corners added up</div><div class="v">${lapTime(ideal)}</div><div class="s">${(best.time - ideal).toFixed(2)} s under your best lap</div></div>
+        <div class="kpi"><div class="k">Best aligned intervals added up</div><div class="v">${lapTime(ideal)}</div><div class="s">${(best.time - ideal).toFixed(2)} s under your best lap</div></div>
       </div>
       <h2>Lap times</h2><p class="sub">Tap a point or a row to look at that lap.</p>
       <div class="chartcard"><div class="legend"><span><i class="sq" style="background:var(--best);border-radius:50%"></i>best lap</span><span><i class="sq" style="background:var(--series-b);border-radius:50%"></i>lap you are looking at</span><span><i style="background:repeating-linear-gradient(90deg,var(--ink-3) 0 5px,transparent 5px 9px)"></i>average ${lapTime(mean)}</span></div><canvas id="lapchart"></canvas></div>
@@ -1169,15 +1182,15 @@
       <h2 id="cmp">${esc(selName)} compared</h2>
       <div class="seg2" role="group" aria-label="Compare with" style="max-width:420px"><button type="button" data-ref="best" aria-pressed="${refMode === "best"}">With the best lap</button><button type="button" data-ref="prev" aria-pressed="${refMode === "prev"}" ${sel === 0 ? "disabled" : ""}>With the lap before</button></div>
       ${same ? `<p class="sub" style="margin-top:12px">This is your best lap. Pick another lap, or compare it with the lap before.</p>` : `
-      <p class="sub" style="margin-top:12px">${esc(selName)} was <b class="${ok[sel].time - ok[refI].time > 0 ? "c-slow" : "c-fast"}">${signedTxt(ok[sel].time - ok[refI].time)} s</b> against ${esc(refName.toLowerCase())}. ${loss[worst] >= 0.1 ? `Most of the loss is in <b>turn ${worst + 1}</b> (${loss[worst].toFixed(2)} s).` : "No single turn lost a tenth or more."}</p>
+      <p class="sub" style="margin-top:12px">${esc(selName)} was <b class="${ok[sel].time - ok[refI].time > 0 ? "c-slow" : "c-fast"}">${signedTxt(ok[sel].time - ok[refI].time)} s</b> against ${esc(refName.toLowerCase())}. ${loss[worst] >= 0.1 ? `The largest pattern-aligned difference is in <b>turn ${worst + 1}</b> (${loss[worst].toFixed(2)} s).` : "No single turn lost a tenth or more."}</p>
       <div class="chartcard"><div class="legend"><span><i style="background:var(--ink)"></i>time lost or gained so far</span><span><i style="background:var(--series-a)"></i>${esc(refName)}</span><span><i style="background:var(--series-b)"></i>${esc(selName)}</span></div>
         <canvas id="cmpchart"></canvas><div class="tip" id="tip" hidden></div></div>
       <p class="small" style="margin-top:8px">Top: the gap as the lap unfolds, rising where ${esc(selName.toLowerCase())} falls behind. ${hasSp ? (sp.measured ? "Middle: the speed of both laps (from the phone's GPS). " : "Middle: the speed of both laps (an estimate, see below). ") : ""}Bottom: how the kart turned (up is left, down is right). The numbers along the top are the turns. Drag a finger across to read any point.</p>
       <h2>Turn by turn</h2><p class="sub">Time through each turn, with the run into it, against ${esc(refName.toLowerCase())}. Red is time lost, green is time gained.</p>
       <div class="cbars">${cbars}</div>
-      <p class="small" style="margin-top:8px">Turns are placed by matching the turn pattern of the laps. A few hundredths is within the method's noise; a tenth or more is worth a look.</p>`}
+      <p class="small" style="margin-top:8px">Turns are placed by matching the turn pattern of the laps. These are pattern-aligned intervals, not measured sector crossings. Their timing error has not been independently established; small apparent gains may be alignment error.</p>`}
       ${speedBlock}
-      <h2>Where the time goes, every lap</h2><p class="sub">Each box is one lap through one turn: how much slower than your quickest pass of that turn. A light column is a turn you often get wrong; a light row is a poor lap.</p>
+      <h2>Where the time goes, every lap</h2><p class="sub">Each box is one lap through one turn: how much slower than your quickest pass of that turn. A light column shows a larger pattern-aligned interval. Driving changes and alignment error can both contribute.</p>
       <div class="chartcard"><div class="legend"><span><i class="sq" style="background:${ramp(0)}"></i>at your best</span><span><i class="sq" style="background:${ramp(0.5)}"></i></span><span><i class="sq" style="background:${ramp(1)}"></i>${hmax.toFixed(2)} s slower</span></div><div class="heat">${heat}</div></div>
       ${foot}</div>`;
     const go = o => viewReview(id, Object.assign({ source, sel, ref: refMode, scroll: "cmp" }, o));

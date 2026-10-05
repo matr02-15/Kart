@@ -7,7 +7,7 @@
 
      LapDetector   finds the lap length from the repetition, picks the most recognisable moment of the
                    lap as its timing point, and reports every pass of it. Lap time = pass to pass, which
-                   equals the official lap time whatever point of the track is used.
+                   is a virtual-point interval, not necessarily an official-line lap time.
      alignLaps     lays one lap over another by matching their turn patterns (dynamic time warping), so
                    time gained or lost can be placed on the lap, corner by corner, without knowing speed.
      findCorners   splits the lap into corners from the turn rate.
@@ -17,6 +17,13 @@
 
   var FS = 20;                       // Hz, working rate of the turn-rate signal
   var CUT = 0.3;                     // where a straight is cut between two corners (share of its length)
+
+  // W3C DeviceMotionEvent: beta about X, gamma about Y, alpha about Z (deg/s).
+  // Missing components are unknown, not measurements of zero.
+  function browserRotation(r) {
+    if (!r || ![r.beta, r.gamma, r.alpha].every(Number.isFinite)) return null;
+    return [r.beta, r.gamma, r.alpha];
+  }
 
   function median(a) { if (!a.length) return NaN; var b = Array.prototype.slice.call(a).sort(function (x, y) { return x - y; }); var m = b.length >> 1; return b.length % 2 ? b[m] : (b[m - 1] + b[m]) / 2; }
 
@@ -250,7 +257,7 @@
   function LapDetector(opts) {
     opts = opts || {};
     this.fs = FS;
-    this.minLap = opts.minLap || 10;         // s
+    this.minLap = opts.minLap || 6;          // s: include short indoor laps
     this.fineHalf = opts.fineHalf || 0;
     this.maxLap = opts.maxLap || 150;        // s
     this.y = [];                             // turn rate, deg/s, at FS
@@ -262,10 +269,16 @@
     this.wins = []; this._lastTry = 0;
     this.quality = 0;                        // how clearly the lap repeats (0..1)
     this.method = null;                      // how the lap length was found
+    this.gaps = []; this.lastSample = null;
+    this.patternCandidate = null; this.discontinuities = [];
   }
 
   /* Feed raw samples: t in seconds from the start, turn rate in deg/s (any rate >= 20 Hz). */
   LapDetector.prototype.push = function (t, yaw) {
+    if (!Number.isFinite(t) || !Number.isFinite(yaw) || t < 0 ||
+        (this.lastSample !== null && t <= this.lastSample)) return false;
+    if (this.lastSample !== null && t - this.lastSample > 0.5) this.gaps.push([this.lastSample, t]);
+    this.lastSample = t;
     // average all raw samples falling in each 1/FS slot (a simple, robust low-pass)
     // A short silence repeats the last value. A long one (the app was in the background, the screen was
     // locked) is filled with "not turning": repeating a cornering value for half a minute would add
@@ -276,6 +289,9 @@
       this.y.push(v); this._acc = 0; this._n = 0; this._next++;
     }
     if (isFinite(yaw)) { this._acc += yaw; this._n++; }
+  };
+  LapDetector.prototype.hasGap = function (start, end) {
+    return this.gaps.some(function (g) { return g[0] < end && g[1] > start; });
   };
   LapDetector.prototype.duration = function () { return this.y.length / this.fs; };
 
@@ -405,8 +421,30 @@
   LapDetector.prototype._best = function (s, cLo, cHi, stretch) {
     var b = null;
     cLo = Math.max(Math.round(0.8 * this.pre), Math.ceil(cLo)); cHi = Math.min(s.length - this.post - 1, Math.floor(cHi));
-    for (var c = cLo; c <= cHi; c++) { var v = this._coarse(s, c, stretch); if (!b || v > b.v) b = { c: c, v: v }; }
+    var first = this.wins[0], last = this.wins[this.wins.length - 1];
+    for (var c = cLo; c <= cHi; c++) {
+      var v = this._coarse(s, c, stretch);
+      if (this.cycle && v >= this.thrLo) {
+        var a = c > last ? last : c, e = c > last ? c : first;
+        if (this._cycleScore(s, a, e) < 0.6) continue;
+      }
+      if (!b || v > b.v) b = { c: c, v: v };
+    }
     return b;
+  };
+
+  // A local corner can look like another corner. Verify the complete ordered cycle before
+  // accepting a normal interval. Correlation is a match diagnostic, not an error bound.
+  LapDetector.prototype._cycleScore = function (s, a, b) {
+    if (!this.cycle || b <= a) return 1;
+    if (this.hasGap(a / this.fs, b / this.fs)) return -1;
+    var T = this.cycle, m = T.length, V = new Float32Array(m);
+    for (var j = 0; j < m; j++) {
+      var x = a + (b - a) * j / m, i = Math.floor(x), f = x - i;
+      if (i < 0 || i + 1 >= s.length) return -1;
+      V[j] = s[i] * (1 - f) + s[i + 1] * f;
+    }
+    var st = stats(T); return ncc(T, V, 0, st.mean, st.norm);
   };
 
   /* Exact position of the timing point near centre c. The kart does not take the same stretch at the
@@ -462,7 +500,7 @@
       var from = Math.max(hi, this._lostFrom || 0), found = null;
       for (var c = Math.ceil(from); c <= avail; c++) {
         var v = this._coarse(s, c);
-        if (v >= this.thrHi) {
+        if (v >= this.thrHi && (!this.cycle || this._cycleScore(s, last, c) >= 0.6)) {
           var bb = { c: c, v: v };
           for (var k = c + 1; k <= Math.min(avail, c + Math.round(0.3 * P)); k++) { var w = this._coarse(s, k); if (w > bb.v) bb = { c: k, v: w }; }
           if (bb.c + Math.round(0.3 * P) > avail && !final && bb.c > avail - 2) break;
@@ -483,21 +521,41 @@
   };
 
   LapDetector.prototype._lock = function (s, final) {
-    var fs = this.fs, lo = Math.round(this.minLap * fs), hi = Math.round(this.maxLap * fs), p, method;
+    var fs = this.fs, lo = Math.round(this.minLap * fs), hi = Math.round(this.maxLap * fs), p, method, t;
     var hp = this._headingPeriod(s);
     if (hp) {
       // sharpen with the repetition of the turn pattern, close to the heading's answer only
       p = this._repeatPeriod(s, Math.max(lo, Math.round(0.93 * hp.L)), Math.min(hi, Math.round(1.07 * hp.L)), false);
       if (!p || p.r < 0.35) p = { L: hp.L, r: 0.35 };
       method = "heading";
+      t = this._chooseTemplate(s, p.L);
     } else {
-      // the heading does not build up (a figure-of-eight track, or too early): only accept a very clear
-      // repetition, and only after a good while
-      if (s.length < 150 * fs || this._headingTrend(s) > 360 / this.maxLap) return false;
-      p = this._repeatPeriod(s, lo, hi, true); method = "repetition";
-      if (!p || p.r < 0.65) return false;
+      t = null;
     }
-    var t = this._chooseTemplate(s, p.L);
+    // A phone's gravity estimate can change the measured yaw scale. A net-turn rule must not
+    // veto clear repetition. Use recent windows so warm-up laps do not hide later steady laps.
+    // This recognises a motion cycle; it does not establish metres or a geographic timing line.
+    if (!t || t.score < 0.1 || t.own < 0.6) {
+      var candidate = null, self = this;
+      [90, 120, 180, 300].forEach(function (seconds) {
+        var off = Math.max(0, s.length - seconds * fs), ss = s.subarray(off);
+        if (self.hasGap(off / fs, s.length / fs)) return;
+        var pp = self._repeatPeriod(ss, lo, Math.min(hi, Math.floor(ss.length / 3.1)), true);
+        if (!pp || pp.r < 0.75) return;
+        var tt = self._chooseTemplate(ss, pp.L);
+        if (!tt || tt.score < 0.12 || tt.own < 0.8) return;
+        var merit = pp.r + tt.score;
+        if (!candidate || merit > candidate.merit) {
+          tt.c += off; candidate = { p: pp, t: tt, merit: merit, start: off };
+        }
+      });
+      if (!candidate) { this.patternCandidate = null; return false; }
+      var previous = this.patternCandidate;
+      this.patternCandidate = { L: candidate.p.L, at: s.length };
+      // Two separate live evaluations must agree; a final pass can use three full repetitions.
+      if (!final && (!previous || Math.abs(previous.L - candidate.p.L) > 0.1 * candidate.p.L)) return false;
+      p = candidate.p; t = candidate.t; method = "repetition";
+    }
     if (!t || t.score < 0.1 || t.own < 0.6) return false;
     this.period = p.L; this.quality = p.r; this.method = method; this.pre = t.pre; this.post = t.post;
     this.template = new Float32Array(s.subarray(t.c - t.pre, t.c + t.post + 1)); this.tStats = stats(this.template);
@@ -508,15 +566,24 @@
     this.thrHi = Math.max(0.6, t.other + 0.5 * (t.own - t.other));
     this.thrLo = Math.max(0.45, Math.min(this.thrHi, t.other + 0.15 * (t.own - t.other), 0.7 * t.own));
     this.wins = [t.c]; this.passes = [t.c]; this.scores = [1]; this._lostFrom = 0; this.lost = 0;
+    this.patternStart = method === "repetition" ? candidate.start : 0;
+    this.cycle = null;
+    if (method === "repetition" && t.c >= p.L) {
+      this.cycle = new Float32Array(160);
+      for (var ci = 0; ci < this.cycle.length; ci++) {
+        var cx = t.c - p.L + p.L * ci / this.cycle.length, ii = Math.floor(cx), cf = cx - ii;
+        this.cycle[ci] = s[ii] * (1 - cf) + s[ii + 1] * cf;
+      }
+    }
     // back-fill: follow the timing point back to the start of the recording, one lap at a time
     for (;;) {
       var first = this.wins[0], b = this._best(s, first - 1.22 * this.period, first - 0.82 * this.period);
-      if (first - 0.82 * this.period < 0.8 * this.pre) break;
+      if (first - 1.3 * this.period < this.patternStart || first - 0.82 * this.period < 0.8 * this.pre) break;
       if (!b || b.v < this.thrLo) { b = this._best(s, first - 1.3 * this.period, first - 0.82 * this.period, true); if (!b || b.v < this.thrHi) break; }
       this._accept(s, b.c, b.v, false);
     }
     this._track(s, final);
-    if (this.passes.length < 2) { this.period = null; this.template = null; this.passes = []; this.scores = []; this.wins = []; return false; }
+    if (this.passes.length < (method === "repetition" ? 3 : 2)) { this.period = null; this.template = null; this.passes = []; this.scores = []; this.wins = []; return false; }
     return true;
   };
 
@@ -535,9 +602,19 @@
       // from everything recorded so far.
       this._lastTry = n;
       var keep = { period: this.period, template: this.template, tStats: this.tStats, fine: this.fine, fStats: this.fStats, pre: this.pre, post: this.post, span: this.span,
-                   thrHi: this.thrHi, thrLo: this.thrLo, wins: this.wins, passes: this.passes, scores: this.scores, quality: this.quality, method: this.method };
+                   thrHi: this.thrHi, thrLo: this.thrLo, wins: this.wins, passes: this.passes, scores: this.scores, quality: this.quality, method: this.method, cycle: this.cycle, patternStart: this.patternStart };
       this.period = null;
-      if (this._lock(sm, false)) { this.relearned = (this.relearned || 0) + 1; return true; }
+      if (this._lock(sm, false)) {
+        var boundary = this.passes[0], count = 0;
+        while (count < keep.passes.length && keep.passes[count] < boundary - 0.5 * this.period) count++;
+        if (count) {
+          this.discontinuities.push([keep.passes[count - 1] / fs, boundary / fs]);
+          this.passes = keep.passes.slice(0, count).concat(this.passes);
+          this.wins = keep.wins.slice(0, count).concat(this.wins);
+          this.scores = keep.scores.slice(0, count).concat(this.scores);
+        }
+        this.relearned = (this.relearned || 0) + 1; return true;
+      }
       for (var k in keep) this[k] = keep[k];
       this.lost = 0;
     }
@@ -552,7 +629,11 @@
     var med = median(times);
     for (i = 1; i < this.passes.length; i++) {
       var tt = times[i - 1];
-      out.push({ n: i, start: this.passes[i - 1] / fs, end: this.passes[i] / fs, time: tt, interrupted: tt > 1.45 * med });
+      var start = this.passes[i - 1] / fs, end = this.passes[i] / fs;
+      var gap = this.hasGap(start, end), transition = this.discontinuities.some(function (d) { return d[0] < end && d[1] > start; });
+      out.push({ n: i, start: start, end: end, time: tt, interrupted: gap || transition || tt > 1.45 * med,
+        reason: gap ? "sensor gap" : transition ? "pattern reacquisition" : tt > 1.45 * med ? "long interval" : null,
+        matchScore: Math.min(this.scores[i - 1], this.scores[i]), timingBasis: "motion pattern", accuracyValidated: false });
     }
     return out;
   };
@@ -891,7 +972,7 @@
     this.acc = isFinite(acc) && acc !== null ? acc : null; this.lastT = t;
     var p = toLocal(this.line.lat, this.line.lon, lat, lon), along = p[0] * this.dx + p[1] * this.dy, across = p[0] * this.dy - p[1] * this.dx;
     this.dist = Math.sqrt(p[0] * p[0] + p[1] * p[1]);
-    if (this.acc !== null && this.acc > this.maxAcc) return null;          // a poor position: not used, and not kept as the "previous" one
+    if (this.acc === null || this.acc < 0 || this.acc > this.maxAcc) return null;          // a poor position: not used, and not kept as the "previous" one
     var q = this.prev, out = null;
     if (q && t > q.t && t - q.t <= 6 && q.along < 0 && along >= 0) {
       var f = -q.along / (along - q.along), ac = q.across + f * (across - q.across), step = Math.sqrt(Math.pow(along - q.along, 2) + Math.pow(across - q.across, 2));
@@ -940,10 +1021,10 @@
       if (t <= T[0]) out[i] = V[0]; else if (t >= T[T.length - 1]) out[i] = V[T.length - 1];
       else { var a = T[k], b = T[k + 1]; if (t < a) { k = 0; while (k < T.length - 2 && T[k + 1] < t) k++; a = T[k]; b = T[k + 1]; } out[i] = V[k] + (V[k + 1] - V[k]) * Math.max(0, Math.min(1, (t - a) / (b - a || 1))); }
     }
-    return { v: out, n: inside, every: (t1 - t0) / inside, acc: accs.length ? median(accs) : null };
+    return { v: out, n: inside, directCount: V.length - derived, derivedCount: derived, speedSource: derived ? "mixed or position-derived" : "provider speed", every: (t1 - t0) / inside, acc: accs.length ? median(accs) : null };
   }
 
-  var api = { FS: FS, turnRate: turnRate, mountAxis: mountAxis, kartForces: kartForces, Slots: Slots, motion: motion, estimateSpeed: estimateSpeed, distanceBetween: distanceBetween, SPD: SPD, LapDetector: LapDetector, lapsFromMarks: lapsFromMarks, lapSignal: lapSignal, alignLaps: alignLaps,
+  var api = { browserRotation: browserRotation, FS: FS, turnRate: turnRate, mountAxis: mountAxis, kartForces: kartForces, Slots: Slots, motion: motion, estimateSpeed: estimateSpeed, distanceBetween: distanceBetween, SPD: SPD, LapDetector: LapDetector, lapsFromMarks: lapsFromMarks, lapSignal: lapSignal, alignLaps: alignLaps,
               findCorners: findCorners, cornerTimes: cornerTimes, median: median, LiveTracker: LiveTracker, lapSignalFine: lapSignalFine, valueAt: valueAt, referenceLap: referenceLap,
               toLocal: toLocal, trackFromFixes: trackFromFixes, GpsTimer: GpsTimer, gpsSpeed: gpsSpeed, refineMarks: refineMarks };
   if (typeof module !== "undefined" && module.exports) module.exports = api; else root.KartCore = api;
