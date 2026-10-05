@@ -568,6 +568,64 @@
     return out;
   }
 
+  /* Marks placed by a tap or by GPS say WHICH lap, to a few tenths of a second. The turn pattern says WHEN, far
+     more finely: the kart turns the same way every time it passes the same place. So take the turn-rate signal
+     around one mark as the model, and move every other mark (by at most `reach` seconds) to where the signal
+     around it fits the model best. Lap times are then pass-to-pass times of one place on the track.
+     A mark whose surroundings do not fit (a lap at a very different pace, a spin) is left where it was.
+     y: turn rate at fs. Returns {marks, moved (how many), shift (typical move, s)}. */
+  function refineMarks(y, marks, fs, reach, useRef) {
+    fs = fs || FS; reach = reach || 1.5;
+    var n = y.length, m = marks.slice(), i, k;
+    if (m.length < 3 || n < 20 * fs) return { marks: m, moved: 0, shift: 0 };
+    var w = Math.round(0.3 * fs), sm = new Float32Array(n), c = new Float64Array(n + 1);
+    for (i = 0; i < n; i++) c[i + 1] = c[i] + (isFinite(y[i]) ? y[i] : 0);
+    for (i = 0; i < n; i++) { var a0 = Math.max(0, i - w), b0 = Math.min(n, i + w + 1); sm[i] = (c[b0] - c[a0]) / (b0 - a0); }
+    var times = []; for (i = 1; i < m.length; i++) times.push(m[i] - m[i - 1]);
+    var med = median(times), h = Math.round(Math.min(6, Math.max(2.5, 0.15 * med)) * fs), len = 2 * h + 1, S = Math.round(reach * fs);
+    // the signal from o0 to o0 + L - 1 samples around `center`, time stretched by a about the centre
+    function win(center, a, buf, o0, L) {
+      var start = center + o0 * a; if (start < 0 || start + (L - 1) * a >= n - 1) return false;
+      for (var q = 0; q < L; q++) { var x = start + q * a, i0 = Math.floor(x), f = x - i0; buf[q] = sm[i0] * (1 - f) + sm[i0 + 1] * f; }
+      return true;
+    }
+    // the model: the mark with the most ordinary laps on both sides
+    var ref = -1, bestD = 1e9, buf = new Float32Array(len);
+    for (i = 0; i < m.length; i++) {
+      var d = (i > 0 ? Math.abs(times[i - 1] - med) : 0.5 * med) + (i < times.length ? Math.abs(times[i] - med) : 0.5 * med);
+      if (d < bestD && win(m[i] * fs, 1, buf, -h, len)) { bestD = d; ref = i; }
+    }
+    if (useRef !== undefined && useRef >= 0 && useRef < m.length) ref = useRef;
+    if (ref < 0) return { marks: m, moved: 0, shift: 0 };
+    var T0 = new Float32Array(len), M0 = win(m[ref] * fs, 1, T0, -h, len) ? { o0: -h, L: len, T: T0, st: stats(T0) } : null;
+    if (!M0 || M0.st.norm < 3 * Math.sqrt(len)) return { marks: m, moved: 0, shift: 0 };      // nothing happens around the line: no pattern to go by
+    function fit(M, c0) {
+      var best = { v: -2, pos: 0, a: 1 }, b2 = new Float32Array(M.L);
+      for (var a = 0.97; a <= 1.031; a += 0.03) {
+        var sc = [], bi = -1;
+        for (k = -S; k <= S; k++) { var v = win(c0 + k, a, b2, M.o0, M.L) ? ncc(M.T, b2, 0, M.st.mean, M.st.norm) : -2; sc.push(v); if (bi < 0 || v > sc[bi]) bi = sc.length - 1; }
+        if (sc[bi] <= best.v) continue;
+        var edge = bi === 0 || bi === sc.length - 1, l = edge ? -2 : sc[bi - 1], r = edge ? -2 : sc[bi + 1], den = l - 2 * sc[bi] + r;
+        var frac = (l > -2 && r > -2 && Math.abs(den) > 1e-9) ? Math.max(-0.5, Math.min(0.5, 0.5 * (l - r) / den)) : 0;
+        best = { v: sc[bi], pos: (bi - S + frac) / fs, a: a, edge: edge };
+      }
+      return best;
+    }
+    // A mark is only moved when the stretch around it fits very well AT THE USUAL PACE (within 3%). If the kart came
+    // to the line clearly slower or faster than on the model pass (a poor last corner, traffic, the first pass after
+    // the pits), a looser fit would shift part of that time into the next lap: the mark then stays where the tap or
+    // the GPS put it.
+    var moved = 0, shifts = [], sharp = m.map(function () { return false; }); sharp[ref] = true;
+    for (i = 0; i < m.length; i++) {
+      if (i === ref) continue;
+      var got = fit(M0, m[i] * fs);
+      if (refineMarks.debug) refineMarks.debug.push([i, got.v, got.pos, got.a]);
+      if (got.v >= 0.85 && !got.edge) { m[i] = marks[i] + got.pos; moved++; shifts.push(Math.abs(got.pos)); sharp[i] = true; }
+    }
+    for (i = 1; i < m.length; i++) if (m[i] <= m[i - 1] + 1) return { marks: marks.slice(), moved: 0, shift: 0 };   // never let marks cross
+    return { marks: m, moved: moved, shift: shifts.length ? median(shifts) : 0, ref: ref, sharp: sharp };
+  }
+
   /* ---------------------------------------------------------------- lap on lap */
   /* Turn rate of one lap at FS, smoothed. y: full-session signal at FS (array), start/end in seconds. */
   function lapSignal(y, start, end, fs) {
@@ -759,7 +817,134 @@
   /* The reference lap for the tracker: the smoothed signal from its exact start, one value per working sample. */
   function referenceLap(sm, start, end, fs) { fs = fs || FS; var n = Math.max(2, Math.round((end - start) * fs)), out = new Float32Array(n); for (var i = 0; i < n; i++) out[i] = valueAt(sm, start + i / fs, fs); return out; }
 
+
+  /* ---------------------------------------------------------------- GPS: a track made once, laps timed at its line */
+  /* Position in metres east and north of a reference point (flat-earth; exact enough over a kart track). */
+  function toLocal(lat0, lon0, lat, lon) {
+    var k = Math.PI / 180, R = 6371000;
+    return [(lon - lon0) * k * R * Math.cos(lat0 * k), (lat - lat0) * k * R];
+  }
+  /* A track from the fixes of one lap that STARTS ON THE START/FINISH LINE (walking, or slowly in the kart).
+     fixes: [[t, lat, lon, accuracy m], ...] in time order. start: [lat, lon] of the line (where the phone
+     stood when the lap was started); the first fix is used when it is not given.
+     The line is a gate through that point, square to the direction in which the lap leaves it.
+     Returns {line: {lat, lon, dir}, length m, acc (typical accuracy m), n, gap (m from the last fix back to
+     the line), path: [[east, north], ...]} or {error: text}. */
+  function trackFromFixes(fixes, start) {
+    var f = fixes.filter(function (p) { return p && isFinite(p[1]) && isFinite(p[2]); });
+    if (f.length < 5) return { error: "Too few positions were received to make a track." };
+    var lat0 = start ? start[0] : f[0][1], lon0 = start ? start[1] : f[0][2], i, pts = [], acc = [];
+    for (i = 0; i < f.length; i++) { pts.push(toLocal(lat0, lon0, f[i][1], f[i][2])); if (isFinite(f[i][3]) && f[i][3] !== null) acc.push(f[i][3]); }
+    // a position wobbles by metres even when standing. Average each with its neighbours, then only count a step
+    // once it is clearly a move (further than the wobble).
+    var sm = [], am = acc.length ? median(acc) : 5, d0 = Math.max(3, 0.8 * am), keep = [[0, 0]], len = 0, far = 0;
+    // (walking, positions are a metre or two apart and need it; driven, they are far apart and averaging would cut the corners)
+    var steps = []; for (i = 1; i < pts.length; i++) steps.push(Math.sqrt(Math.pow(pts[i][0] - pts[i - 1][0], 2) + Math.pow(pts[i][1] - pts[i - 1][1], 2)));
+    var ms = median(steps), hw = ms >= 4 ? 0 : ms >= 2 ? 1 : 2;
+    for (i = 0; i < pts.length; i++) { var x = 0, y = 0, c = 0; for (var j = Math.max(0, i - hw); j <= Math.min(pts.length - 1, i + hw); j++) { x += pts[j][0]; y += pts[j][1]; c++; } sm.push([x / c, y / c]); }
+    for (i = 0; i < sm.length; i++) {
+      var last = keep[keep.length - 1], dx = sm[i][0] - last[0], dy = sm[i][1] - last[1], d = Math.sqrt(dx * dx + dy * dy);
+      if (d >= d0) { len += d; keep.push(sm[i]); }
+      far = Math.max(far, Math.sqrt(sm[i][0] * sm[i][0] + sm[i][1] * sm[i][1]));
+    }
+    if (keep.length < 4 || far < 10) return { error: "The lap is too short to make a track: the positions never moved more than " + far.toFixed(0) + " m from the line." };
+    // direction of travel leaving the line: the average direction to the first points 8 to 30 m away
+    // (the first ones only, 8 to 12 m out: further on the track has already started to turn)
+    var dir = null, sx = 0, sy = 0, gone = 0, rmax = 0;
+    for (i = 1; i < keep.length; i++) {
+      gone += Math.sqrt(Math.pow(keep[i][0] - keep[i - 1][0], 2) + Math.pow(keep[i][1] - keep[i - 1][1], 2));
+      var r = Math.sqrt(keep[i][0] * keep[i][0] + keep[i][1] * keep[i][1]);
+      if (r < rmax - 2 || ((r > 12.5 || gone > 16) && (sx !== 0 || sy !== 0))) break;
+      rmax = Math.max(rmax, r);
+      if (r >= 8) { sx += keep[i][0] / r; sy += keep[i][1] / r; }
+    }
+    if (sx !== 0 || sy !== 0) dir = Math.atan2(sx, sy) * 180 / Math.PI;
+    if (dir === null) return { error: "The direction of the lap could not be found." };
+    var end = keep[keep.length - 1], gap = Math.sqrt(end[0] * end[0] + end[1] * end[1]);
+    // How wide the gate may be. The phone's position can be several metres out, so the gate should be wide; but
+    // another part of the track that goes through the same line in the same direction must stay outside it.
+    var ux = Math.sin(dir * Math.PI / 180), uy = Math.cos(dir * Math.PI / 180), near = 1e9, run = 0;
+    for (i = 1; i < keep.length; i++) {
+      run += Math.sqrt(Math.pow(keep[i][0] - keep[i - 1][0], 2) + Math.pow(keep[i][1] - keep[i - 1][1], 2));
+      if (run < 25 || len - run < 25) continue;                         // the line's own surroundings
+      var a0 = keep[i - 1][0] * ux + keep[i - 1][1] * uy, a1 = keep[i][0] * ux + keep[i][1] * uy;
+      if (a0 < 0 && a1 >= 0) { var ff = -a0 / (a1 - a0), c0 = keep[i - 1][0] * uy - keep[i - 1][1] * ux, c1 = keep[i][0] * uy - keep[i][1] * ux; near = Math.min(near, Math.abs(c0 + ff * (c1 - c0))); }
+    }
+    var half = Math.max(6, Math.min(25, 0.45 * near));
+    return { line: { lat: lat0, lon: lon0, dir: dir, half: Math.round(half * 10) / 10 }, length: len + gap, acc: acc.length ? median(acc) : null, n: f.length, gap: gap,
+             path: keep.map(function (q) { return [Math.round(q[0] * 10) / 10, Math.round(q[1] * 10) / 10]; }) };
+  }
+  /* Times each pass of the line from the phone's positions (about one a second).
+     A pass is two positions in a row with the line between them, going the way the track was made, and
+     close enough to the line's centre (half, m). Its time is placed between the two positions in
+     proportion to their distances from the line. Positions the phone itself calls poor are left out.
+     push(t, lat, lon, acc) returns the time of a pass, or null. */
+  function GpsTimer(line, opts) {
+    opts = opts || {};
+    this.line = line; this.half = opts.half || line.half || 12; this.maxAcc = opts.maxAcc || 20; this.minLap = opts.minLap || 8;
+    var a = line.dir * Math.PI / 180; this.dx = Math.sin(a); this.dy = Math.cos(a);
+    this.prev = null; this.marks = []; this.acc = null; this.lastT = null; this.dist = null;
+  }
+  GpsTimer.prototype.push = function (t, lat, lon, acc, speed) {
+    if (!isFinite(lat) || !isFinite(lon) || lat === null || lon === null || !isFinite(t)) return null;
+    if (this.lastT !== null && t <= this.lastT) return null;                 // an old or repeated position: ignored, the last good one stays
+    this.acc = isFinite(acc) && acc !== null ? acc : null; this.lastT = t;
+    var p = toLocal(this.line.lat, this.line.lon, lat, lon), along = p[0] * this.dx + p[1] * this.dy, across = p[0] * this.dy - p[1] * this.dx;
+    this.dist = Math.sqrt(p[0] * p[0] + p[1] * p[1]);
+    if (this.acc !== null && this.acc > this.maxAcc) return null;          // a poor position: not used, and not kept as the "previous" one
+    var q = this.prev, out = null;
+    if (q && t > q.t && t - q.t <= 6 && q.along < 0 && along >= 0) {
+      var f = -q.along / (along - q.along), ac = q.across + f * (across - q.across), step = Math.sqrt(Math.pow(along - q.along, 2) + Math.pow(across - q.across, 2));
+      var tc = q.t + f * (t - q.t), last = this.marks.length ? this.marks[this.marks.length - 1] : null;
+      // A kart standing on the line must not count laps while its position wobbles: the kart has to be MOVING
+      // through the gate.
+      // The phone's own GPS speed tells standing from moving well (walking pace is enough); without it, only a clear
+      // move between the two positions does.
+      var hasV = isFinite(speed) && speed !== null && speed !== undefined;
+      var moving = hasV && q.v !== null ? (speed >= 1 && q.v >= 1) : (step >= 3 && step / (t - q.t) >= 2.5);
+      if (moving && Math.abs(ac) <= this.half && step <= 200 && (last === null || tc - last >= this.minLap)) { this.marks.push(tc); out = tc; }
+    }
+    this.prev = { t: t, along: along, across: across, v: isFinite(speed) && speed !== null && speed !== undefined ? speed : null };
+    return out;
+  };
+  /* Is the position good enough to time with right now? (a recent position, of acceptable accuracy) */
+  GpsTimer.prototype.healthy = function (now) { return this.lastT !== null && now - this.lastT <= 5 && this.acc !== null && this.acc <= this.maxAcc; };
+
+  /* Speed from the phone's positions, at fs, over `n` samples: the phone's own GPS speed where it gives one,
+     otherwise distance over time between positions. loc: [[t, lat, lon, acc, speed, heading], ...].
+     Returns {v (m/s), n (positions used), every (s between positions), acc} or null when there are too few
+     good positions between t0 and t1 to call it a measurement. */
+  function gpsSpeed(loc, n, t0, t1, fs) {
+    fs = fs || FS;
+    var g = (loc || []).filter(function (p) { return p && p[1] !== null && p[2] !== null && p[3] !== null && p[3] <= 15; }), i, T = [], V = [], derived = 0;
+    for (i = 0; i < g.length; i++) {
+      var v = g[i][4];
+      if (v === null || v === undefined || !isFinite(v)) {
+        if (i === 0 || g[i][0] - g[i - 1][0] <= 0 || g[i][0] - g[i - 1][0] > 3) continue;
+        var d = toLocal(g[i - 1][1], g[i - 1][2], g[i][1], g[i][2]); v = Math.sqrt(d[0] * d[0] + d[1] * d[1]) / (g[i][0] - g[i - 1][0]);
+        T.push(0.5 * (g[i][0] + g[i - 1][0])); V.push(v); derived++; continue;
+      }
+      T.push(g[i][0]); V.push(v);
+    }
+    // speed worked out from positions jumps about: average each value with its two neighbours
+    if (derived > 0.5 * V.length && V.length >= 3) { var V2 = V.slice(); for (i = 1; i < V.length - 1; i++) V2[i] = (V[i - 1] + V[i] + V[i + 1]) / 3; V = V2; }
+    var inside = 0, gapMax = 0, lastIn = t0, accs = [];
+    for (i = 0; i < T.length; i++) if (T[i] >= t0 && T[i] <= t1) { inside++; gapMax = Math.max(gapMax, T[i] - lastIn); lastIn = T[i]; }
+    gapMax = Math.max(gapMax, t1 - lastIn);
+    for (i = 0; i < g.length; i++) if (g[i][0] >= t0 && g[i][0] <= t1) accs.push(g[i][3]);
+    if (t1 - t0 < 5 || inside < 10 || inside < 0.4 * (t1 - t0) || gapMax > 8) return null;
+    var out = new Float32Array(n), k = 0;
+    for (i = 0; i < n; i++) {
+      var t = (i + 0.5) / fs;
+      while (k < T.length - 2 && T[k + 1] < t) k++;
+      if (t <= T[0]) out[i] = V[0]; else if (t >= T[T.length - 1]) out[i] = V[T.length - 1];
+      else { var a = T[k], b = T[k + 1]; if (t < a) { k = 0; while (k < T.length - 2 && T[k + 1] < t) k++; a = T[k]; b = T[k + 1]; } out[i] = V[k] + (V[k + 1] - V[k]) * Math.max(0, Math.min(1, (t - a) / (b - a || 1))); }
+    }
+    return { v: out, n: inside, every: (t1 - t0) / inside, acc: accs.length ? median(accs) : null };
+  }
+
   var api = { FS: FS, turnRate: turnRate, mountAxis: mountAxis, kartForces: kartForces, Slots: Slots, motion: motion, estimateSpeed: estimateSpeed, distanceBetween: distanceBetween, SPD: SPD, LapDetector: LapDetector, lapsFromMarks: lapsFromMarks, lapSignal: lapSignal, alignLaps: alignLaps,
-              findCorners: findCorners, cornerTimes: cornerTimes, median: median, LiveTracker: LiveTracker, lapSignalFine: lapSignalFine, valueAt: valueAt, referenceLap: referenceLap };
+              findCorners: findCorners, cornerTimes: cornerTimes, median: median, LiveTracker: LiveTracker, lapSignalFine: lapSignalFine, valueAt: valueAt, referenceLap: referenceLap,
+              toLocal: toLocal, trackFromFixes: trackFromFixes, GpsTimer: GpsTimer, gpsSpeed: gpsSpeed, refineMarks: refineMarks };
   if (typeof module !== "undefined" && module.exports) module.exports = api; else root.KartCore = api;
 })(typeof self !== "undefined" ? self : this);

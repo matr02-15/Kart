@@ -176,3 +176,18 @@ h2 small.est { font-size: 12px; font-weight: 500; color: var(--amber-ink); backg
 
 #toast { position: fixed; left: 50%; bottom: calc(18px + env(safe-area-inset-bottom, 0px)); transform: translateX(-50%); background: var(--ink); color: var(--black); padding: 10px 16px;
   border-radius: 8px; font-size: 14.5px; max-width: calc(100% - 32px); z-index: 50; }
+
+/* tracks made with GPS */
+.chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.chip { font: inherit; font-size: 15px; padding: 10px 14px; min-height: 44px; border-radius: 999px; border: 1px solid var(--line); background: transparent; color: var(--ink); cursor: pointer; }
+.chip small { color: var(--ink-3); margin-left: 4px; }
+.chip[aria-pressed="true"] { background: var(--ink); color: var(--page); border-color: var(--ink); }
+.chip[aria-pressed="true"] small { color: inherit; opacity: 0.7; }
+.chip.add { border-style: dashed; color: var(--ink-2); }
+.chip:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+.gpsline { display: flex; flex-direction: column; gap: 4px; padding: 12px 14px; border-radius: 10px; border: 1px solid var(--line); margin: 14px 0; }
+.gpsline b { font-size: 18px; }
+.gpsline.good { border-color: var(--faster); }
+.gpsline.bad { border-color: var(--slower); }
+.steps { margin: 0 0 14px; padding-left: 22px; }
+.steps li { margin: 6px 0; }
