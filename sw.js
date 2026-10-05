@@ -2,7 +2,7 @@
    The app is always opened from the copy saved on the phone: it starts at once, and a weak signal in a
    metal hall cannot make it hang. A new version is fetched as a whole in the background when there is
    a connection, and replaces the saved copy only when every file of it has arrived. */
-const CACHE = "apex-trace-kart-2.3.0";
+const CACHE = "apex-trace-kart-2.3.1";
 const FILES = ["./", "index.html", "app.css", "core.js", "sim.js", "app.js", "accuracy.js", "validation.html", "validation-ui.js", "manifest.webmanifest", "icon-192.png", "icon-512.png"];
 self.addEventListener("install", e => {
   e.waitUntil(caches.open(CACHE)

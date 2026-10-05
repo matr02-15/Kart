@@ -1,7 +1,7 @@
 /* app.js -- Apex Trace Kart 2: screens, sensors and storage. The measuring is in core.js. */
 (function () {
   "use strict";
-  const K = window.KartCore, VERSION = "2.3.0", G0 = 9.80665;
+  const K = window.KartCore, VERSION = "2.3.1", G0 = 9.80665;
   const $ = (s, r) => (r || document).querySelector(s), $$ = (s, r) => Array.from((r || document).querySelectorAll(s));
   const esc = s => String(s === null || s === undefined ? "" : s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
   const app = $("#app");
@@ -1066,12 +1066,26 @@
     row(["Log Date", `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()}`, "", "", "Origin Time", "0.000", "s"]); row(["Log Time", `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`, "", "", "Start Time", "0.000", "s"]);
     row(["Sample Rate", fs.toFixed(3), "Hz", "", "End Time", (n / fs).toFixed(3), "s"]); row(["Duration", (n / fs).toFixed(3), "s", "", "Start Distance", "0", "m"]); row(["Range", "entire outing", "", "", "End Distance", "", "m"]);
     row(["Beacon Markers", marks.filter(t => t > 0 && t < n / fs).map(t => t.toFixed(3)).join(" ")]);
-    out.push("", ""); row(["Time", "Ground Speed", "G Force Lat", "G Force Long", "Chassis Yaw Rate", "Lap Number"]); row(["s", "km/h", "G", "G", "deg/s", ""]); out.push("", "");
+    // GPS positions, so that the PC program draws the track from where the phone really was (one position a
+    // second, joined by straight lines) instead of guessing its shape from speed and sideways force.
+    const fx = (data.loc || []).filter(p => p && Number.isFinite(p[0]) && Number.isFinite(p[1]) && Number.isFinite(p[2]) && !(Number.isFinite(p[3]) && p[3] > 25)).sort((a, b) => a[0] - b[0]);
+    const hasPos = fx.length >= 10; let fi = 0;
+    const posAt = t => {
+      if (!hasPos) return null;
+      while (fi < fx.length - 2 && fx[fi + 1][0] < t) fi++;
+      const a = fx[fi], b = fx[fi + 1];
+      if (t < a[0] - 2 || t > b[0] + 2 || b[0] - a[0] > 5 || b[0] <= a[0]) return null;      // no position near this moment: left empty
+      const f = Math.max(0, Math.min(1, (t - a[0]) / (b[0] - a[0])));
+      return [a[1] + f * (b[1] - a[1]), a[2] + f * (b[2] - a[2])];
+    };
+    out.push("", ""); row(["Time", "Ground Speed", "G Force Lat", "G Force Long", "Chassis Yaw Rate", "Lap Number"].concat(hasPos ? ["GPS Latitude", "GPS Longitude"] : [])); row(["s", "km/h", "G", "G", "deg/s", ""].concat(hasPos ? ["deg", "deg"] : [])); out.push("", "");
     let lap = 0;
     for (let i = 0; i < n; i++) {
       const t = (i + 0.5) / fs; while (lap < marks.length && marks[lap] <= t) lap++;
       const f = sp.flipped ? -1 : 1, la = mo.lat[i], lo = mo.lon[i];
-      row([t.toFixed(3), (3.6 * sp.v[i]).toFixed(2), isFinite(la) ? (f * la / G0).toFixed(3) : "", isFinite(lo) ? (f * lo / G0).toFixed(3) : "", mo.yaw[i].toFixed(2), lap]);
+      const cells = [t.toFixed(3), (3.6 * sp.v[i]).toFixed(2), isFinite(la) ? (f * la / G0).toFixed(3) : "", isFinite(lo) ? (f * lo / G0).toFixed(3) : "", mo.yaw[i].toFixed(2), lap];
+      if (hasPos) { const ps = posAt(t); cells.push(ps ? ps[0].toFixed(7) : "", ps ? ps[1].toFixed(7) : ""); }
+      row(cells);
     }
     return out.join("\n") + "\n";
   }
