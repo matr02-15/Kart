@@ -1,7 +1,7 @@
 /* app.js -- Apex Trace Kart 2: screens, sensors and storage. The measuring is in core.js. */
 (function () {
   "use strict";
-  const K = window.KartCore, VERSION = "2.3.1", G0 = 9.80665;
+  const K = window.KartCore, VERSION = "2.4.0", G0 = 9.80665;
   const $ = (s, r) => (r || document).querySelector(s), $$ = (s, r) => Array.from((r || document).querySelectorAll(s));
   const esc = s => String(s === null || s === undefined ? "" : s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
   const app = $("#app");
@@ -49,14 +49,15 @@
   /* ------------------------------------------------------------------ settings (this phone only) */
   const FIELD_KEYS = ["current", "delta", "pred", "last", "best", "lastdiff", "lastprev", "lap", "avg3", "clock", "left", "gnow", "gpeak"];
   const DEFAULT_DASH = { main: "current", tiles: ["delta", "last", "best", "lap"], deltaBar: true, gBar: true };
-  const settings = { track: "", trackId: "", trackLength: 0, source: "auto", mic: true, loc: true, minutes: 0, dash: JSON.parse(JSON.stringify(DEFAULT_DASH)) };
+  const settings = { track: "", trackId: "", trackLength: 0, environment: "indoor", source: "auto", mic: true, loc: true, minutes: 0, dash: JSON.parse(JSON.stringify(DEFAULT_DASH)) };
   try {
     const saved = JSON.parse(localStorage.getItem("atk-settings") || "{}");
     Object.assign(settings, saved);
     if (!settings.dash || !FIELD_KEYS.includes(settings.dash.main) || !Array.isArray(settings.dash.tiles)) settings.dash = JSON.parse(JSON.stringify(DEFAULT_DASH));
     settings.dash.tiles = settings.dash.tiles.filter(k => FIELD_KEYS.includes(k)).slice(0, 6);
   } catch (e) { /* private mode */ }
-  /* Tracks made with GPS (one slow lap from the start/finish line). Kept on this phone. */
+  if (settings.environment !== "outdoor") settings.trackId="";
+  /* Outdoor tracks made with GPS (one slow lap from the start/finish line). Kept on this phone. */
   function loadTracks() { try { const t = JSON.parse(localStorage.getItem("atk-tracks") || "[]"); return Array.isArray(t) ? t.filter(x => x && x.id && x.line && isFinite(x.line.lat) && isFinite(x.line.lon) && isFinite(x.line.dir)) : []; } catch (e) { return []; } }
   function saveTracks(list) { try { localStorage.setItem("atk-tracks", JSON.stringify(list)); return true; } catch (e) { return false; } }
   function trackById(id) { return id ? (loadTracks().find(t => t.id === id) || null) : null; }
@@ -98,7 +99,7 @@
   };
 
   /* ------------------------------------------------------------------ recorder */
-  const COLS = ["t", "ax", "ay", "az", "gx", "gy", "gz", "rx", "ry", "rz", "yaw", "g", "steer"];
+  const COLS = ["t", "ax", "ay", "az", "gx", "gy", "gz", "rx", "ry", "rz", "yaw", "g", "steer", "gyroValid", "linearValid"];
   class Rec {
     constructor() { this.nc = COLS.length; this.cap = 60 * 60 * 2; this.buf = new Float32Array(this.cap * this.nc); this.n = 0; }
     push(row) {
@@ -111,8 +112,8 @@
   /* ------------------------------------------------------------------ a session being driven */
   let cur = null;
   function newSession(source) {
-    return { id: "s" + Date.now().toString(36), track: settings.track.trim() || "Unnamed track", started: Date.now(), source, rec: new Rec(), det: new K.LapDetector(),
-             marks: [], t: 0, gf: null, gS: 0, gLapMax: 0, gMax: 0, events: 0, hasLin: false, hasGyro: false, audio: { t: [], bins: [] }, lastLapN: 0, sim: null,
+    return { id: "s" + Date.now().toString(36), track: settings.track.trim() || "Unnamed track", started: Date.now(), source, rec: new Rec(), det: new window.KartIndoor.IndoorDetector(), environment: settings.environment || "indoor",
+             marks: [], t: 0, gf: null, gS: 0, gLapMax: 0, gMax: 0, events: 0, hasLin: false, hasGyro: false, lastGyroTime: -Infinity, lastLinearTime: -Infinity, audio: { t: [], bins: [] }, lastLapN: 0, sim: null,
              trk: null, trkRef: null, trkPasses: -1, trkAnchor: 0, log: [], gaps: 0, gapTime: 0, errs: 0, wake: "not asked", ending: false,
              trackLength: Number(settings.trackLength) > 0 ? Number(settings.trackLength) : 0, loc: [], locWatch: null, gps: null, gpsMarks: 0, gpsTrack: null };
   }
@@ -123,7 +124,7 @@
   /* ------------------------------------------------------------------ laps and the live figure */
   /* Which timing drives the dash right now. With automatic timing, the driver's own taps stand in until
      the lap has been found (2 to 3 laps on a normal track, minutes on a track that crosses over itself). */
-  function liveSource(s) { return s.source === "taps" || (s.det.state() === "learning" && s.marks.length >= 1) ? "taps" : "auto"; }
+  function liveSource(s) { return s.source === "taps" || (s.det.period === null && s.marks.length >= 1) ? "taps" : "auto"; }
   function currentLaps(s) { const laps = liveSource(s) === "taps" ? K.lapsFromMarks(s.marks) : s.det.laps(); return laps.map(l => s.det.hasGap(l.start, l.end) ? Object.assign({}, l, { interrupted: true, reason: "sensor gap" }) : l); }
   function lastPass(s) { return liveSource(s) === "taps" ? (s.marks.length ? s.marks[s.marks.length - 1] : null) : s.det.lastPass(); }
   function passCount(s) { return liveSource(s) === "taps" ? s.marks.length : s.det.passes.length; }
@@ -134,7 +135,8 @@
     const best = ok.length ? ok.reduce((a, b) => b.time < a.time ? b : a) : null, pass = lastPass(s);
     const m = { t, laps, last, prev, best, timing: pass !== null, lapClock: pass !== null ? t - pass : null, delta: null, pred: null, lapN: laps.length + (pass !== null ? 1 : 0),
                 gS: s.gS, gLapMax: s.gLapMax, left: settings.minutes > 0 ? Math.max(0, settings.minutes * 60 - t) : null, source: liveSource(s), standIn: s.source === "auto" && liveSource(s) === "taps", state: s.source === "taps" ? "taps" : s.det.state(),
-                gps: !!s.gps, gpsOk: !!s.gps && s.gps.healthy(t), gpsAcc: s.gps ? s.gps.acc : null };
+                gps: !!s.gps, gpsOk: !!s.gps && s.gps.healthy(t), gpsAcc: s.gps ? s.gps.acc : null,
+                forceValid: t-s.lastLinearTime<=0.5, forceEver:s.hasLin };
     // live plus or minus to the best lap: follow the best lap's turn pattern from the last pass
     if (best && pass !== null && s.det.y.length > 20) {
       const fs = K.FS, sm = s.det._smooth(), n = passCount(s);
@@ -148,7 +150,7 @@
       m.delta = s.trk.delta(); m.pred = best.time + m.delta;
       // Pattern tracker may estimate delta but cannot reset the confirmed lap clock.
       // m.lapClock = s.trk.lapClock() + behind;                         // restarts at the line at once, without waiting for the pass to be confirmed
-      if (s.trk.lap > 0 || !s.hasGyro || t - s.tS > 0.5) { m.delta = null; m.pred = null; }
+      if (s.trk.lap > 0 || s.det.rateBlocked || t-s.lastGyroTime > 0.5 || (s.det.channel==='lateral' && !m.forceValid) || t - s.tS > 0.5) { m.delta = null; m.pred = null; }
     }
     return m;
   }
@@ -166,8 +168,8 @@
   /* What a tile or the main display can show. Each returns the text and its colour (a CSS variable). */
   const FIELDS = {
     current: { name: "This lap", label: "THIS LAP", get: m => ({ text: m.timing ? lapTime(m.lapClock, 1) : clock(m.t), color: "--ink" }) },
-    delta: { name: "Plus or minus to best lap, live", label: "± BEST", get: m => m.delta === null ? { text: "-.--", color: "--ink-3" } : { text: signed(m.delta), color: m.delta <= 0 ? "--faster" : "--slower" } },
-    pred: { name: "Predicted lap time", label: "PREDICTED", get: m => m.pred === null ? { text: "--.--", color: "--ink-3" } : { text: lapTime(m.pred), color: m.delta <= 0 ? "--faster" : "--ink" } },
+    delta: { name: "Estimated live motion delta to best lap", label: "EST ± BEST", get: m => m.delta === null ? { text: "-.--", color: "--ink-3" } : { text: signed(m.delta), color: m.delta <= 0 ? "--faster" : "--slower" } },
+    pred: { name: "Estimated lap time", label: "EST LAP", get: m => m.pred === null ? { text: "--.--", color: "--ink-3" } : { text: lapTime(m.pred), color: m.delta <= 0 ? "--faster" : "--ink" } },
     last: { name: "Last lap", label: "LAST LAP", get: m => m.last ? { text: lapTime(m.last.time), color: lapColour(m.laps, m.laps.length - 1) } : { text: "--.--", color: "--ink-3" } },
     best: { name: "Best lap", label: "BEST LAP", get: m => m.best ? { text: lapTime(m.best.time), color: "--best" } : { text: "--.--", color: "--ink-3" } },
     lastdiff: { name: "Last lap against best", label: "LAST ± BEST", get: m => m.last && m.best && !m.last.interrupted ? { text: signed(m.last.time - m.best.time), color: m.last === m.best ? "--best" : "--slower" } : { text: "-.--", color: "--ink-3" } },
@@ -176,8 +178,8 @@
     avg3: { name: "Average of the last 3 laps", label: "AVG LAST 3", get: m => { const v = m.laps.filter(l => !l.interrupted).slice(-3); return v.length ? { text: lapTime(v.reduce((a, b) => a + b.time, 0) / v.length), color: "--ink" } : { text: "--.--", color: "--ink-3" }; } },
     clock: { name: "Session time", label: "SESSION", get: m => ({ text: clock(m.t), color: "--ink" }) },
     left: { name: "Time left in the session", label: "TIME LEFT", get: m => m.left === null ? { text: "-:--", color: "--ink-3" } : { text: clock(m.left), color: m.left < 60 ? "--amber" : "--ink" } },
-    gnow: { name: "Force now (G)", label: "FORCE G", get: m => ({ text: m.gS.toFixed(1), color: "--ink" }) },
-    gpeak: { name: "Peak force this lap (G)", label: "PEAK G", get: m => ({ text: m.gLapMax.toFixed(1), color: "--ink" }) },
+    gnow: { name: "Force now (G)", label: "FORCE G", get: m => ({ text: m.forceValid===false?'—':m.gS.toFixed(1), color: "--ink" }) },
+    gpeak: { name: "Peak force this lap (G)", label: "PEAK G", get: m => ({ text: m.forceEver===false?'—':m.gLapMax.toFixed(1), color: "--ink" }) },
   };
 
   /* Build a dashboard from a configuration; returns a function that refreshes it from a model. */
@@ -198,7 +200,7 @@
     const put = (key, el, f) => { const sig = f.text + "|" + f.color; if (cache[key] !== sig) { cache[key] = sig; el.innerHTML = SEG(f.text, css(f.color)); } };
     return function refresh(m) {
       const mainKey = cfg.main, learning = m.state === "learning";
-      ref["L-main"].textContent = mainKey === "current" && !m.timing ? (m.source === "taps" ? (m.gps && m.gpsOk ? "CROSS THE LINE" : "TAP AT THE LINE") : "LEARNING THE TRACK") : FIELDS[mainKey].label;
+      ref["L-main"].textContent = mainKey === "current" && !m.timing ? (m.source === "taps" ? (m.gps && m.gpsOk ? "CROSS THE LINE" : "TAP AT THE LINE") : (m.state === "unavailable" ? "DETECTION UNAVAILABLE" : "LEARNING LAPS")) : FIELDS[mainKey].label;
       put("main", ref["V-main"], FIELDS[mainKey].get(m));
       tiles.forEach((k, i) => put("t" + i, ref["V-" + i], FIELDS[k].get(m)));
       if (ref.dfill) {
@@ -208,7 +210,7 @@
           ref.learn.style.width = "0";
         } else { ref.dfill.style.width = "0"; ref.learn.style.width = learning && m.learn !== undefined ? (100 * m.learn).toFixed(0) + "%" : "0"; }
       }
-      if (ref.gfill) { ref.gfill.style.width = Math.min(100, 100 * m.gS / 2.5).toFixed(1) + "%"; ref.gmark.style.left = Math.min(99.4, 100 * m.gLapMax / 2.5).toFixed(1) + "%"; }
+      if (ref.gfill) { ref.gfill.style.width = (m.forceValid===false?0:Math.min(100, 100 * m.gS / 2.5)).toFixed(1) + "%"; ref.gmark.style.left = Math.min(99.4, 100 * m.gLapMax / 2.5).toFixed(1) + "%"; ref.gmark.hidden=m.forceEver===false; }
       if (ref.status) ref.status.textContent = m.status || "";
     };
   }
@@ -330,7 +332,7 @@
     if (cur || starting) return;                 // a second tap on "Start" must not start a second session
     starting = true;
     try {
-      const trk = sim ? null : trackById(settings.trackId);
+      const trk = sim || settings.environment !== "outdoor" ? null : trackById(settings.trackId);
       const s = cur = newSession(trk ? "taps" : settings.source);
       s.t0 = performance.now();
       if (trk) { try { s.gps = new K.GpsTimer(trk.line); s.gpsTrack = { id: trk.id, name: trk.name, line: trk.line, length: trk.length || 0 }; s.track = trk.name; } catch (e) { s.gps = null; } }
@@ -389,7 +391,7 @@
     try {
       if (ticks % 5 === 0 && s.source === "auto") { const was = s.det.relearned || 0; s.det.update(); if ((s.det.relearned || 0) !== was) note(s, "lap learnt again"); }
       m = model(s);
-      if (s.source === "auto" && !s.found && s.det.state() !== "learning") { s.found = true; note(s, "lap found: " + (s.det.period / K.FS).toFixed(1) + " s, by " + s.det.method); }
+      if (s.source === "auto" && !s.found && s.det.period !== null) { s.found = true; note(s, "lap found: " + (s.det.period / K.FS).toFixed(1) + " s, by " + s.det.method); }
     } catch (e) {
       // the timing failed on this data; the recording is separate and carries on
       s.errs++; s.errAt = s.t; if (s.errs <= 5) note(s, "timing error: " + (e && e.message));
@@ -401,7 +403,8 @@
       s.lastLapN = m.laps.length; s.gLapMax = s.gS;
       $$('[data-tile="last"]').forEach(c => { c.classList.remove("flash"); void c.offsetWidth; c.classList.add("flash"); });
     }
-    if (m.state === "learning") m.learn = Math.min(0.9, s.det.duration() / 120);
+    // Recognition progress is not elapsed time. Correlation is not an accuracy percentage.
+    m.learn = undefined;
     const live = !s.sim;
     if (m.state === "error" || (s.errAt !== undefined && s.t - s.errAt < 5)) m.status = "Lap timing hit a problem. Still recording.";
     else if (live && !s.gps && s.t > 3 && s.events === 0) m.status = "No motion data from this phone";
@@ -409,6 +412,7 @@
     else if (live && s.t > 3 && !s.hasGyro && s.source === "auto") m.status = "No turn sensor: tap at the line";
     else if (live && s.t > 2 && s.t < 25 && s.wake !== "held") m.status = "Screen may switch off: battery saver?";
     else if (m.standIn) m.status = "Timing from your taps while the track is learnt";
+    else if (m.state === "unavailable") m.status = "Detection unavailable: " + s.det.diagnostics().reason + ". Recording continues.";
     else if (m.state === "learning") m.status = s.t < 20 ? "Learning repeated laps; accuracy unvalidated" : s.t < 150 ? "Finding the lap. Tap at the line for times now" : "Lap not found yet. Tap at the line for times";
     else if (s.gps && s.locOff) m.status = "Location is not allowed: tap at the line";
     else if (s.gps && !m.gpsOk) m.status = s.gps.lastT === null ? "Waiting for GPS. Tap at the line meanwhile" : s.t - s.gps.lastT > 5 ? "GPS lost. Tap at the line" : "GPS too weak (±" + (m.gpsAcc === null ? "?" : m.gpsAcc.toFixed(0)) + " m). Tap at the line";
@@ -442,13 +446,13 @@
     const fallback = s.source === "auto" && auto.length < 1 && taps.length >= 1, source = s.source === "taps" || fallback ? "taps" : "auto", laps = source === "taps" ? taps : auto;
     const meta = summary(s, laps, source);
     meta.trackLength = s.trackLength || 0;
-    meta.sensorSchema = 3; meta.gyroAxes = "xyz: beta,gamma,alpha"; meta.accuracyValidated = false;
+    meta.sensorSchema = 4; meta.measurementMode = s.environment; meta.recordingHealth = window.KartIndoor.recordingHealth(s.rec.data(), COLS.length); meta.gyroAxes = "xyz: beta,gamma,alpha"; meta.accuracyValidated = false;
     meta.sharp = sharp; if (s.gpsTrack) meta.gps = { track: s.gpsTrack.name, line: s.gpsTrack.line, length: s.gpsTrack.length, marks: s.gpsMarks };
     meta.fallback = fallback; meta.open = !final;                         // open: the session was not stopped (the app was closed, or it is still running)
-    try { meta.detector = { state: s.det.state(), lapLength: s.det.period ? s.det.period / K.FS : null, method: s.det.method, quality: s.det.quality, relearned: s.det.relearned || 0 }; } catch (e) { meta.detector = { state: "error" }; }
+    try { meta.detector = { state: s.det.state(), lapLength: s.det.period ? s.det.period / K.FS : null, method: s.det.method, quality: s.det.quality, diagnostics: s.det.diagnostics(), relearned: s.det.relearned || 0 }; } catch (e) { meta.detector = { state: "error" }; }
     const ab = new Uint8Array(s.audio.bins.length * NB); s.audio.bins.forEach((row, i) => ab.set(row, i * NB));
     const data = { id: s.id, rec: s.rec.data(), nc: COLS.length, y20: Float32Array.from(s.det.y), marks: s.marks.slice(), marksUsed: used, autoLaps: auto, tapLaps: taps,
-                   audioT: Float32Array.from(s.audio.t), audioBins: ab, nb: NB, loc: s.loc.slice(), sensorSchema: 3 };
+                   audioT: Float32Array.from(s.audio.t), audioBins: ab, nb: NB, loc: s.loc.slice(), sensorSchema: 4 };
     // the measurements first: a session listed without its data would be worse than one not listed
     let ok = await Store.put("data", data);
     if (!ok && ab.length) ok = await Store.put("data", Object.assign({}, data, { audioT: new Float32Array(0), audioBins: new Uint8Array(0) }));   // short of space: drop the sound picture, keep the rest
@@ -523,7 +527,7 @@
   function sample(t, a, g, r) {
     const s = cur; if (!s || !Number.isFinite(t) || t < 0 || (s.events > 0 && t <= s.tS)) return;
     let grav, lin;
-    if (a) { grav = [g[0] - a[0], g[1] - a[1], g[2] - a[2]]; lin = a; s.hasLin = true; }
+    if (a) { grav = [g[0] - a[0], g[1] - a[1], g[2] - a[2]]; lin = a; s.hasLin = true; s.lastLinearTime=t; }
     else {
       // no gravity-free reading from the phone: take gravity as the slow part of the signal
       const k = s.gf ? Math.min(1, Math.max(0, t - (s.tS || 0)) / 1.2) : 1;
@@ -531,7 +535,7 @@
       grav = s.gf; lin = [g[0] - grav[0], g[1] - grav[1], g[2] - grav[2]];
     }
     const gn = Math.hypot(grav[0], grav[1], grav[2]) || 1, up = [grav[0] / gn, grav[1] / gn, grav[2] / gn];
-    const w = r || [0, 0, 0]; if (r) s.hasGyro = true;
+    const w = r || [0, 0, 0]; if (r) {s.hasGyro = true;s.lastGyroTime=t;}
     // how fast the kart turns: the phone's rotation about the vertical, with the phone's own turning
     // with the steering wheel taken out (see turnRate in core.js)
     const yaw = K.turnRate ? K.turnRate(w, up) : w[0] * up[0] + w[1] * up[1] + w[2] * up[2];
@@ -542,11 +546,12 @@
     const since = t - (s.tS || 0);
     if (s.events > 0 && since > 0.5) { s.gaps++; s.gapTime += since; note(s, "no motion data for " + since.toFixed(1) + " s"); }
     const dt = Math.max(0, Math.min(0.2, since)); s.tS = t; s.t = t; s.events++;
-    s.gS += (gH - s.gS) * Math.min(1, dt / 0.25);                     // what the eye can follow
-    if (s.gS > s.gLapMax) s.gLapMax = s.gS;
-    if (s.gS > s.gMax) s.gMax = s.gS;
-    s.rec.push([t, lin[0], lin[1], lin[2], g[0], g[1], g[2], w[0], w[1], w[2], yaw, gH, steer]);   // the recording first: it must survive anything below
-    try { if (r) s.det.push(t, yaw); } catch (e) { s.errs++; }
+    if(a){s.gS += (gH - s.gS) * Math.min(1, dt / 0.25);                // what the eye can follow
+      if (s.gS > s.gLapMax) s.gLapMax = s.gS;
+      if (s.gS > s.gMax) s.gMax = s.gS;}
+    s.rec.push([t, lin[0], lin[1], lin[2], g[0], g[1], g[2], w[0], w[1], w[2], yaw, gH, steer, r ? 1 : 0, a ? 1 : 0]);   // the recording first: it must survive anything below
+    const forces = a && r ? K.kartForces(lin, up) : null;
+    try { s.det.push(t, r ? yaw : NaN, forces ? forces[1] / G0 : NaN, forces ? forces[0] / G0 : NaN); } catch (e) { s.errs++; }
   }
 
   function onMotion(e) {
@@ -606,9 +611,10 @@
       <div class="top"><div class="mark">${MARK}Apex Trace Kart <small>${VERSION}</small></div></div>
       <div class="card">
         <div class="field" style="margin-top:0"><label for="track">Track</label><input type="text" id="track" value="${esc(settings.track)}" placeholder="Name of the track" autocomplete="off" maxlength="40"></div>
-        <div class="field"><label for="tlen">Length of the track in metres, if you know it (calibrates the estimated scale; does not validate it)</label><input type="number" id="tlen" min="0" max="5000" step="1" inputmode="numeric" placeholder="not known" value="${Number(settings.trackLength) > 0 ? Number(settings.trackLength) : ""}"></div>
-        <div class="lbl" style="margin:14px 0 6px">Tracks made with GPS</div>
-        <div class="chips">${tracks.map(t => `<button type="button" class="chip" data-trk="${esc(t.id)}" aria-pressed="${t.id === settings.trackId}">${esc(t.name)} <small>${t.length ? Math.round(t.length) + " m" : ""}</small></button>`).join("")}<button type="button" class="chip add" id="mktrack">+ Create a track</button></div>
+        <div class="field"><label for="environment">Measurement mode</label><select id="environment"><option value="indoor" ${settings.environment !== "outdoor" ? "selected" : ""}>Indoor — motion and lap timing</option><option value="outdoor" ${settings.environment === "outdoor" ? "selected" : ""}>Outdoor — GPS timing available</option></select></div>
+      <div class="field" ${settings.environment==='indoor'?'hidden':''}><label for="tlen">Length of the track in metres, if you know it (calibrates the estimated scale; does not validate it)</label><input type="number" id="tlen" min="0" max="5000" step="1" inputmode="numeric" placeholder="not known" value="${Number(settings.trackLength) > 0 ? Number(settings.trackLength) : ""}"></div>
+        <div class="lbl" ${settings.environment==='indoor'?'hidden':''} style="margin:14px 0 6px">Outdoor tracks made with GPS</div>
+        <div class="chips" ${settings.environment==='indoor'?'hidden':''}>${tracks.map(t => `<button type="button" class="chip" data-trk="${esc(t.id)}" aria-pressed="${t.id === settings.trackId}">${esc(t.name)} <small>${t.length ? Math.round(t.length) + " m" : ""}</small></button>`).join("")}<button type="button" class="chip add" id="mktrack">+ Create a track</button></div>
         <div id="gpsbox" ${settings.trackId ? "" : "hidden"}>
           <p class="small" style="margin:10px 0 6px"><b>Lap timing: GPS.</b> Each lap is timed when the phone's position crosses the start/finish line of this track. Nothing to tap. If the GPS is too weak during the session the dash says so, and a tap at the line times the lap instead.</p>
           <p class="small" style="margin:0 0 14px"><button class="linkbtn" id="rmtrack" type="button">Delete this track</button></p>
@@ -632,7 +638,7 @@
         : `<p class="sub">No session yet. Every session you drive is kept on this phone and listed here.</p>`}
       <p class="small" id="offline" style="margin-top:26px"></p>
     </div>`;
-    const note = () => { $("#srcnote").textContent = settings.source === "auto" ? "Laps are found from the way the kart turns. Learning repeated laps; accuracy unvalidated and include the laps already driven. If you also tap the screen at the line, you get times from the first lap, and your taps are kept as a second set of lap times." : "Tap anywhere on the screen each time you cross the line."; };
+    const note = () => { $("#srcnote").textContent = settings.source === "auto" ? "Drive several clean laps while the app looks for a distinctive repeating motion pattern. Recognised intervals include earlier laps. The timing point is virtual; official-line accuracy needs an independent check. If recognition is unavailable, recording continues and the reason is saved. Optional line taps are kept separately." : "Tap anywhere on the screen each time you cross the line. Recorded taps include human reaction error."; };
     note();
     $("#track").addEventListener("input", e => {
       settings.track = e.target.value; if (settings.trackLength) { settings.trackLength = 0; $("#tlen").value = ""; }
@@ -642,7 +648,7 @@
     });
     $$("[data-trk]").forEach(b => b.addEventListener("click", () => {
       const t = trackById(b.dataset.trk); if (!t) return viewHome();
-      if (settings.trackId === t.id) settings.trackId = ""; else { settings.trackId = t.id; settings.track = t.name; settings.trackLength = 0; }
+      if (settings.trackId === t.id) settings.trackId = ""; else { settings.trackId = t.id; settings.environment = "outdoor"; settings.track = t.name; settings.trackLength = 0; }
       saveSettings(); viewHome();
     }));
     $("#mktrack").addEventListener("click", viewTrack);
@@ -651,6 +657,7 @@
       if (Date.now() - rmAsked > 4000) { rmAsked = Date.now(); e.target.textContent = "Tap again to delete this track (sessions are kept)"; return; }
       saveTracks(loadTracks().filter(t => t.id !== settings.trackId)); settings.trackId = ""; saveSettings(); viewHome();
     });
+    $("#environment").addEventListener("change", e => { settings.environment=e.target.value; if(settings.environment === "indoor") settings.trackId=""; saveSettings(); viewHome(); });
     $("#tlen").addEventListener("input", e => { settings.trackLength = Math.max(0, Math.min(5000, Number(e.target.value) || 0)); saveSettings(); });
     $$("[data-src]").forEach(b => b.addEventListener("click", () => { settings.source = b.dataset.src; saveSettings(); $$("[data-src]").forEach(x => x.setAttribute("aria-pressed", String(x === b))); note(); }));
     $("#start").addEventListener("click", () => startDrive(null));
@@ -730,7 +737,7 @@
       const list = loadTracks(), t = { id: "t" + Date.now().toString(36), name, line: tr.line, length: Math.round(tr.length), acc: tr.acc, made: Date.now(), path: tr.path.slice(0, 600) };
       list.push(t);
       if (!saveTracks(list)) { e.textContent = "The phone would not store the track (storage full or blocked)."; e.hidden = false; return; }
-      settings.trackId = t.id; settings.track = name; settings.trackLength = 0; saveSettings();
+      settings.trackId = t.id; settings.environment = "outdoor"; settings.track = name; settings.trackLength = 0; saveSettings();
       stop(); leaveTrack = null;
       toast(`Track saved: about ${t.length} m. It is selected: tap Start session when you are ready.`, 6000);
       viewHome();
@@ -977,15 +984,19 @@
       `# Phone,${JSON.stringify(navigator.userAgent)}`,
       ...(meta.log || []).map(l => `# Log,${l[0]},${JSON.stringify(l[1])}`),
       `# Sensor schema,${meta.sensorSchema || 2}`,
+      `# Measurement mode,${meta.measurementMode || "indoor"}`,
+      `# Recording health,${JSON.stringify(meta.recordingHealth || {})}`,
+      `# Detector diagnostics,${JSON.stringify(meta.detector || {})}`,
+      `# Interval evidence,${JSON.stringify((meta.source==='auto'?data.autoLaps:data.tapLaps)||[])}`,
       `# Accuracy validated,false`,
       `# Timing basis,${meta.source === "auto" ? "virtual motion-pattern point" : "physical-line marks: GPS or taps"}`,
       `# Track length given (m),${meta.trackLength || ""}`,
       ...((data.loc || []).length ? ["# Location fixes: time s, latitude, longitude, accuracy m, GPS speed m/s, heading deg"] : []),
       ...(data.loc || []).map(p => "# Loc," + p.map(x => x === null ? "" : x).join(",")),
       "# Columns: time s; acceleration without gravity m/s2 (phone axes x y z); acceleration with gravity m/s2; rotation rate deg/s about x y z; turn rate of the kart deg/s (rotation about the vertical, the wheel's own rotation removed); horizontal force G; wheel angle estimate deg",
-      "time,acc_x,acc_y,acc_z,accg_x,accg_y,accg_z,rot_x,rot_y,rot_z,turn_rate,g_horizontal,wheel_angle");
-    const d = [6, 5, 5, 5, 5, 5, 5, 4, 4, 4, 4, 5, 4];
-    for (let i = 0; i < n; i++) { const r = []; for (let c = 0; c < nc; c++) r.push(rec[i * nc + c].toFixed(d[c])); out.push(r.join(",")); }
+      "time,acc_x,acc_y,acc_z,accg_x,accg_y,accg_z,rot_x,rot_y,rot_z,turn_rate,g_horizontal,wheel_angle" + (nc >= 15 ? ",gyro_valid,linear_valid" : ""));
+    const d = [6, 5, 5, 5, 5, 5, 5, 4, 4, 4, 4, 5, 4, 0, 0];
+    for (let i = 0; i < n; i++) { const r = []; for (let c = 0; c < nc; c++) r.push(rec[i * nc + c].toFixed(d[c] === undefined ? 6 : d[c])); out.push(r.join(",")); }
     return out.join("\n") + "\n";
   }
   /* ------------------------------------------------------------------ review */
@@ -1015,7 +1026,7 @@
     let sp;
     try {
       let rows = data.rec;
-      if (!meta.demo && meta.sensorSchema !== 3 && rows && rows.length && data.nc >= 10) {
+      if (!meta.demo && !(meta.sensorSchema >= 3) && rows && rows.length && data.nc >= 10) {
         rows = Array.from(rows);
         for (let i = 0; i < rows.length; i += data.nc) { const z = rows[i + 7], x = rows[i + 8], y = rows[i + 9]; rows[i + 7] = x; rows[i + 8] = y; rows[i + 9] = z; }
       }
@@ -1054,38 +1065,75 @@
     speedCache = { key, sp };
     return sp;
   }
+  function indoorMotion(meta, data) {
+    let rec=data.rec;
+    if(!meta.demo && !(meta.sensorSchema>=3)) {rec=Array.from(rec);for(let o=0;o<rec.length;o+=data.nc){const z=rec[o+7],x=rec[o+8],y=rec[o+9];rec[o+7]=x;rec[o+8]=y;rec[o+9]=z;}}
+    return K.motion(rec,data.nc);
+  }
+  function indoorPcFile(meta,data,laps) {
+    const mo=indoorMotion(meta,data),out=[],row=a=>out.push(a.map(x=>'"'+String(x).replace(/"/g,'""')+'"').join(','));
+    const marks=laps.length?laps.map(l=>l.start).concat(laps[laps.length-1].end):[];
+    row(['Format','MoTeC CSV File']);row(['Venue',meta.track]);row(['Vehicle','Kart']);row(['Device','Apex Trace Kart '+VERSION+' (phone)']);
+    row(['Measurement mode','indoor']);row(['Accuracy validated','false']);row(['Timing basis',meta.source==='auto'?'virtual motion-pattern point':'recorded physical-line marks']);
+    row(['Sensor schema',meta.sensorSchema||2]);row(['Recording health',JSON.stringify(meta.recordingHealth||{})]);row(['Detector diagnostics',JSON.stringify(meta.detector||{})]);
+    row(['Interval evidence',JSON.stringify(laps)]);
+    row(['Comment','Time-domain indoor motion recording. Speed, position and distance are not supplied as measurements.']);
+    row(['Sample Rate',K.FS]);row(['Beacon Markers',marks.map(x=>x.toFixed(6)).join(' ')]);
+    out.push('','');row(['Time','G Force Lat','G Force Long','Chassis Yaw Rate','Lap Number']);row(['s','G','G','deg/s','']);out.push('','');
+    let lap=0;
+    for(let i=0;i<mo.yaw.length;i++){const t=(i+0.5)/K.FS;while(lap<marks.length&&marks[lap]<=t)lap++;
+      row([t.toFixed(6),Number.isFinite(mo.lat[i])?(mo.lat[i]/G0).toFixed(5):'',Number.isFinite(mo.lon[i])?(mo.lon[i]/G0).toFixed(5):'',Number.isFinite(mo.yaw[i])?mo.yaw[i].toFixed(4):'',lap]);}
+    return out.join('\n')+'\n';
+  }
+  async function reviewIndoor(id,opts) {
+    const meta=await Store.get('sessions',id),data=await Store.get('data',id);if(!meta||!data){toast('Session data unavailable');return viewHome();}
+    const source=(opts&&opts.source)||meta.source,laps=(source==='taps'?data.tapLaps:data.autoLaps)||[],ok=laps.filter(l=>!l.interrupted),health=meta.recordingHealth||window.KartIndoor.recordingHealth(data.rec,data.nc);
+    const mo=indoorMotion(meta,data),best=ok.length?ok.reduce((a,b)=>a.time<b.time?a:b):null;
+    const mean=ok.length?ok.reduce((a,b)=>a+b.time,0)/ok.length:null,sd=mean===null?null:Math.sqrt(ok.reduce((a,b)=>a+(b.time-mean)**2,0)/ok.length);
+    const detector=meta.detector||{},diag=detector.diagnostics||{};
+    app.innerHTML=`<div class="page">${headHtml(meta)}<div class="note"><b>Indoor engineering review</b> · ${source==='auto'?'Virtual motion-pattern point':'Recorded line marks'}. Accuracy has not been independently established. Charts use recorded time, not estimated metres. <a href="validation.html">Timing evidence</a></div>
+      <div class="kpis"><div class="kpi"><div class="k">Complete intervals</div><div class="v">${ok.length}</div></div><div class="kpi"><div class="k">Best recorded interval</div><div class="v">${lapTime(best&&best.time)}</div></div><div class="kpi"><div class="k">Standard deviation</div><div class="v">${sd===null?'—':sd.toFixed(3)+' s'}</div></div></div>
+      <h2>Recording integrity</h2><p>${health.samples} motion events; median received rate ${health.medianRateHz?health.medianRateHz.toFixed(1):'unknown'} Hz; ${health.gaps.length} gaps over 0.5 s. ${health.gyroValidFraction===null?'Legacy recording: missing-field validity was not recorded.':`Valid gyro ${(health.gyroValidFraction*100).toFixed(1)}%; gravity-free acceleration ${(health.linearValidFraction*100).toFixed(1)}%.`}</p>
+      <p class="sub">Recognition: ${esc(detector.method||'not established')}. ${esc(diag.reason||'Save the raw recording to investigate this session.')} Correlation describes pattern agreement, not timing accuracy.</p>
+      <h2>Motion comparison</h2><p class="sub">Lateral/longitudinal G and kart turn rate are transformed phone measurements. Broad comparisons need consistent mounting. Deceleration does not measure the brake pedal.</p>
+      ${ok.length?`<div class="row"><label>Reference <select id="indoor-ref">${ok.map(l=>`<option value="${l.n}" ${l===best?'selected':''}>Interval ${l.n} · ${lapTime(l.time)}</option>`).join('')}</select></label><label>Compare <select id="indoor-compare">${ok.map(l=>`<option value="${l.n}" ${l===ok[ok.length-1]?'selected':''}>Interval ${l.n} · ${lapTime(l.time)}</option>`).join('')}</select></label><label>Axis <select id="indoor-axis"><option value="time">Elapsed seconds</option><option value="phase">Normalised lap %</option></select></label></div><canvas id="indoor-chart" style="width:100%;height:420px" aria-label="Motion traces against time"></canvas>`:'<p>No complete recognised intervals. The raw recording is still available below.</p>'}
+      <h2>Recorded intervals</h2><table class="laps"><thead><tr><th>Interval</th><th>Duration</th><th>To best</th><th>Evidence</th></tr></thead><tbody>${laps.map(l=>`<tr><td>${l.n}</td><td>${lapTime(l.time,3)}</td><td>${best?signedTxt(l.time-best.time,3):'—'}</td><td>${esc(l.reason||'complete recorded interval')}</td></tr>`).join('')}</tbody></table>
+      ${data.marks.length>=2&&source!=='taps'?'<button class="btn" id="indoor-taps">Review recorded line marks</button>':''}${footHtml(meta)}</div>`;
+    wireFoot(meta,data,laps,source,{indoor:true});
+    const draw=()=>{
+      const cv=$('#indoor-chart');if(!cv)return;const a=ok.find(l=>l.n===Number($('#indoor-ref').value)),b=ok.find(l=>l.n===Number($('#indoor-compare').value)),phase=$('#indoor-axis').value==='phase';
+      const ctx=cv.getContext('2d'),W=Math.max(280,cv.clientWidth),H=420,dpr=window.devicePixelRatio||1;cv.width=W*dpr;cv.height=H*dpr;ctx.scale(dpr,dpr);ctx.clearRect(0,0,W,H);
+      const defs=[['Lateral G',mo.lat,G0],['Longitudinal G',mo.lon,G0],['Kart turn rate (deg/s)',mo.yaw,1]],colors=[css('--faster'),css('--series-2')||'#ffb020'];
+      defs.forEach(([label,arr,unit],j)=>{const top=25+j*126,h=95,left=46,right=W-12,xmax=phase?100:Math.max(a.time,b.time);let max=0.2;
+        for(const l of [a,b])for(let i=Math.ceil(l.start*K.FS);i<Math.min(arr.length,l.end*K.FS);i++)if(Number.isFinite(arr[i]))max=Math.max(max,Math.abs(arr[i]/unit));
+        ctx.fillStyle=css('--ink');ctx.font='12px sans-serif';ctx.fillText(label,left,top-7);ctx.strokeStyle=css('--ink-3');ctx.beginPath();ctx.moveTo(left,top+h/2);ctx.lineTo(right,top+h/2);ctx.stroke();ctx.fillText(max.toFixed(1),2,top+10);ctx.fillText((-max).toFixed(1),2,top+h);
+        [a,b].forEach((l,k)=>{ctx.strokeStyle=colors[k];ctx.lineWidth=k?1.3:2;ctx.beginPath();let pen=false;for(let i=Math.ceil(l.start*K.FS);i<Math.min(arr.length,l.end*K.FS);i++){const elapsed=(i+0.5)/K.FS-l.start,x=phase?elapsed/l.time*100:elapsed,v=arr[i]/unit;if(!Number.isFinite(v)||health.gaps.some(g=>(i+0.5)/K.FS>=g[0]&&(i+0.5)/K.FS<=g[1])){pen=false;continue;}const xx=left+x/xmax*(right-left),yy=top+h/2-v/max*h/2;if(pen)ctx.lineTo(xx,yy);else{ctx.moveTo(xx,yy);pen=true;}}ctx.stroke();});
+        ctx.fillStyle=css('--ink');for(let k=0;k<=4;k++)ctx.fillText((xmax*k/4).toFixed(phase?0:1)+(phase?'%':'s'),left+(right-left)*k/4-7,top+h+14);
+      });
+    };
+    if(ok.length){['#indoor-ref','#indoor-compare','#indoor-axis'].forEach(s=>$(s).addEventListener('change',draw));draw();app._redraw=draw;}
+    if($('#indoor-taps'))$('#indoor-taps').addEventListener('click',()=>viewReview(id,{source:'taps'}));window.scrollTo(0,0);
+  }
   /* A file the computer program (Apex Trace) reads: time, speed, forces, turn rate and lap markers at 20 a second. */
   function pcFile(meta, data, laps, sp) {
+    if (meta.measurementMode !== "outdoor") return indoorPcFile(meta, data, laps);
     const mo = sp.mo, n = Math.min(sp.v.length, mo.yaw.length), fs = sp.fs, out = [], q = x => '"' + String(x).replace(/"/g, "'") + '"', d = new Date(meta.started), pad = x => String(x).padStart(2, "0");
     const marks = laps.length ? laps.map(l => l.start).concat([laps[laps.length - 1].end]) : [];
     const row = a => out.push(a.map(q).join(","));
     row(["Format", "MoTeC CSV File", "", "", "Workbook", ""]); row(["Venue", meta.track, "", "", "Worksheet", ""]); row(["Vehicle", "Kart", "", "", "Vehicle Desc", ""]);
     row(["Driver", "", "", "", "Engine ID", ""]); row(["Device", "Apex Trace Kart " + (meta.version || VERSION) + " (phone)"]);
+    row(["Measurement mode", "outdoor"]);
     row(["Accuracy validated", "false"]); row(["Speed provenance", sp.measured ? sp.measured.speedSource : "inertial model estimate"]); row(["Timing basis", meta.source === "auto" ? "virtual motion-pattern point" : "recorded physical-line marks"]);
     row(["Comment", sp.measured ? "Speed from the phone's GPS (about one position a second). Forces and turn rate from the phone's motion sensors. No pedals." : "Speed and distance are ESTIMATES from the phone's motion sensors" + (sp.scaled ? ", scaled to a track length of " + meta.trackLength + " m" : "") + ". No pedals, no GPS.", "", "", "Session", "Kart"]);
     row(["Log Date", `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()}`, "", "", "Origin Time", "0.000", "s"]); row(["Log Time", `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`, "", "", "Start Time", "0.000", "s"]);
     row(["Sample Rate", fs.toFixed(3), "Hz", "", "End Time", (n / fs).toFixed(3), "s"]); row(["Duration", (n / fs).toFixed(3), "s", "", "Start Distance", "0", "m"]); row(["Range", "entire outing", "", "", "End Distance", "", "m"]);
     row(["Beacon Markers", marks.filter(t => t > 0 && t < n / fs).map(t => t.toFixed(3)).join(" ")]);
-    // GPS positions, so that the PC program draws the track from where the phone really was (one position a
-    // second, joined by straight lines) instead of guessing its shape from speed and sideways force.
-    const fx = (data.loc || []).filter(p => p && Number.isFinite(p[0]) && Number.isFinite(p[1]) && Number.isFinite(p[2]) && !(Number.isFinite(p[3]) && p[3] > 25)).sort((a, b) => a[0] - b[0]);
-    const hasPos = fx.length >= 10; let fi = 0;
-    const posAt = t => {
-      if (!hasPos) return null;
-      while (fi < fx.length - 2 && fx[fi + 1][0] < t) fi++;
-      const a = fx[fi], b = fx[fi + 1];
-      if (t < a[0] - 2 || t > b[0] + 2 || b[0] - a[0] > 5 || b[0] <= a[0]) return null;      // no position near this moment: left empty
-      const f = Math.max(0, Math.min(1, (t - a[0]) / (b[0] - a[0])));
-      return [a[1] + f * (b[1] - a[1]), a[2] + f * (b[2] - a[2])];
-    };
-    out.push("", ""); row(["Time", "Ground Speed", "G Force Lat", "G Force Long", "Chassis Yaw Rate", "Lap Number"].concat(hasPos ? ["GPS Latitude", "GPS Longitude"] : [])); row(["s", "km/h", "G", "G", "deg/s", ""].concat(hasPos ? ["deg", "deg"] : [])); out.push("", "");
+    out.push("", ""); row(["Time", "Ground Speed", "G Force Lat", "G Force Long", "Chassis Yaw Rate", "Lap Number"]); row(["s", "km/h", "G", "G", "deg/s", ""]); out.push("", "");
     let lap = 0;
     for (let i = 0; i < n; i++) {
       const t = (i + 0.5) / fs; while (lap < marks.length && marks[lap] <= t) lap++;
       const f = sp.flipped ? -1 : 1, la = mo.lat[i], lo = mo.lon[i];
-      const cells = [t.toFixed(3), (3.6 * sp.v[i]).toFixed(2), isFinite(la) ? (f * la / G0).toFixed(3) : "", isFinite(lo) ? (f * lo / G0).toFixed(3) : "", mo.yaw[i].toFixed(2), lap];
-      if (hasPos) { const ps = posAt(t); cells.push(ps ? ps[0].toFixed(7) : "", ps ? ps[1].toFixed(7) : ""); }
-      row(cells);
+      row([t.toFixed(3), (3.6 * sp.v[i]).toFixed(2), isFinite(la) ? (f * la / G0).toFixed(3) : "", isFinite(lo) ? (f * lo / G0).toFixed(3) : "", mo.yaw[i].toFixed(2), lap]);
     }
     return out.join("\n") + "\n";
   }
@@ -1093,7 +1141,7 @@
   /* The review of a session. If the detailed page cannot be built from this session's data, a plain page
      takes its place: the lap times and the files are always reachable. */
   async function viewReview(id, opts) {
-    try { await reviewFull(id, opts); }
+    try { const meta = await Store.get("sessions", id); if (meta && meta.measurementMode !== "outdoor") await reviewIndoor(id, opts); else await reviewFull(id, opts); }
     catch (e) { try { await reviewPlain(id, opts, e); } catch (e2) { toast("This session could not be opened (" + (e2 && e2.message) + "). It is still on the phone."); viewHome(); } }
   }
   async function reviewPlain(id, opts, err) {
@@ -1113,7 +1161,7 @@
     const meta = await Store.get("sessions", id), data = await Store.get("data", id);
     if (!meta || !data) { toast("That session is no longer on this phone."); return viewHome(); }
     const source = opts.source || meta.source, laps = (source === "taps" ? data.tapLaps : data.autoLaps) || [], ok = laps.filter(l => !l.interrupted);
-    const head = headHtml(meta) + `<div class="note" style="margin-top:12px"><b>${meta.demo ? "Simulation" : "Development recording"}</b> · ${source === "auto" ? "Virtual motion-pattern timing point" : "Recorded line marks"}. ${meta.demo ? "Synthetic results do not establish real-track accuracy." : "Timing accuracy has not been independently established. Distance and corner analysis from motion are estimates."} <a href="validation.html">Replay and check against independent timing</a>${!meta.demo && meta.sensorSchema !== 3 ? "<br>Legacy session: gyro fields were stored in the wrong axis order. Raw-axis replay can repair the signal; stored lap boundaries remain the original results." : ""}</div>`, foot = footHtml(meta);
+    const head = headHtml(meta) + `<div class="note" style="margin-top:12px"><b>${meta.demo ? "Simulation" : "Development recording"}</b> · ${source === "auto" ? "Virtual motion-pattern timing point" : "Recorded line marks"}. ${meta.demo ? "Synthetic results do not establish real-track accuracy." : "Timing accuracy has not been independently established. Distance and corner analysis from motion are estimates."} <a href="validation.html">Replay and check against independent timing</a>${!meta.demo && !(meta.sensorSchema >= 3) ? "<br>Legacy session: gyro fields were stored in the wrong axis order. Raw-axis replay can repair the signal; stored lap boundaries remain the original results." : ""}</div>`, foot = footHtml(meta);
     if (ok.length < 2) {
       app.innerHTML = `<div class="page">${head}
         <div class="note">${laps.length < 1 ? (source === "taps" ? (meta.gps ? "The GPS did not see two passes of the start/finish line in this session, so there is no lap to show. Look at the location line below: it says how good the phone's position was." : "Fewer than two taps were recorded, so there is no lap to show.") :
@@ -1228,7 +1276,7 @@
       ll.textContent = `Location from the phone: ${loc.length} fix${loc.length === 1 ? "" : "es"}, one every ${(meta.duration / loc.length).toFixed(1)} s on average` + (acc.length ? `, accuracy claimed ${acc[acc.length >> 1].toFixed(0)} m typically (best ${acc[0].toFixed(0)} m)` : "") + (withSpeed ? `, ${withSpeed} with a GPS speed.` : ", none with a GPS speed.") + (acc.length && acc[acc.length >> 1] > 8 ? " Too coarse to place the kart on the track." : "");
     } else if (ll) ll.textContent = meta.demo ? "" : "No location was received from the phone during this session.";
     const pc = $("#pcfile");
-    if (pc && sp) { pc.hidden = false; pc.addEventListener("click", () => { try { download(fileBase(meta) + "_for_ApexTrace.csv", pcFile(meta, data, laps, sp)); toast("Saved to the phone's Downloads folder."); } catch (e) { toast("The file could not be made (" + (e && e.message) + ")."); } }); }
+    if (pc && sp) { pc.hidden = false; pc.addEventListener("click", () => { try { download(fileBase(meta) + "_for_ApexTrace.csv", pcFile(Object.assign({},meta,{source}), data, laps, sp)); toast("Saved to the phone's Downloads folder."); } catch (e) { toast("The file could not be made (" + (e && e.message) + ")."); } }); }
     $("#back").addEventListener("click", viewHome);
     $("#again").addEventListener("click", () => startDrive(null));
     const base = fileBase(meta);
@@ -1265,7 +1313,7 @@
     navigator.serviceWorker.register("sw.js").then(reg => { setTimeout(offlineLine, 1500); try { reg.update().catch(() => {}); } catch (e) { /* later */ } }).catch(() => {});
   }
   let rz = null;
-  window.addEventListener("resize", () => { clearTimeout(rz); rz = setTimeout(() => { if (app._redraw && $("#lapchart")) app._redraw(); }, 150); });
+  window.addEventListener("resize", () => { clearTimeout(rz); rz = setTimeout(() => { if (app._redraw && ($("#lapchart") || $("#indoor-chart"))) app._redraw(); }, 150); });
   window.__kart = { get cur() { return cur; }, Store, viewHome, viewReview, model, settings, mem };      // for the test suite
   viewHome();
 })();

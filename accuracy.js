@@ -2,6 +2,7 @@
 (function(root) {
   'use strict';
   const K = typeof module !== 'undefined' && module.exports ? require('./core.js') : root.KartCore;
+  const I = typeof module !== 'undefined' && module.exports ? require('./indoor.js') : root.KartIndoor;
   function percentile(a,q) { if (!a.length) return null; const b=a.slice().sort((x,y)=>x-y); return b[Math.min(b.length-1,Math.ceil(q*b.length)-1)]; }
   function parseRecording(text) {
     if (typeof text !== 'string' || text.length > 40e6) throw Error('Recording missing or larger than 40 MB.');
@@ -25,26 +26,31 @@
     const columns=['time','acc_x','acc_y','acc_z','accg_x','accg_y','accg_z','rot_x','rot_y','rot_z'];
     if(!header || !columns.every(c=>header.includes(c)) || rows.length<2) throw Error('Use the app\'s raw Save data file CSV, not the desktop-analysis export.');
     const rec=[], t=[], yaw=[], gaps=[];
-    let prev=-1, rejected=0; const legacy=schema!==3;
+    let prev=-1, rejected=0; const legacy=!(schema>=3),gv=header.indexOf('gyro_valid'),lv=header.indexOf('linear_valid'),nc=gv>=0||lv>=0?15:10;
     for(const row of rows) {
       const v=columns.map(c=>row[header.indexOf(c)]), time=v[0];
       if(time<0 || time<=prev) { rejected++; continue; }
       if(prev>=0 && time-prev>0.5) gaps.push([prev,time]); prev=time;
       // Before schema 3 the browser stored alpha,beta,gamma in columns labelled x,y,z.
       if(legacy) { const z=v[7],x=v[8],y=v[9]; v[7]=x;v[8]=y;v[9]=z; }
-      rec.push(...v); t.push(time);
+      rec.push(...v); if(nc===15)rec.push(0,0,0,gv>=0?row[gv]:1,lv>=0?row[lv]:1);t.push(time);
     }
     if(!rec.length || t[t.length-1]>5400) throw Error('Recording duration invalid or exceeds 90 minutes.');
-    const mo=K.motion(rec,10), det=new K.LapDetector();
-    // Reconstruct the corrected mount signal, preserving original missing-time intervals.
-    for(let i=0;i<mo.yaw.length;i++) {
-      const time=(i+0.5)/K.FS;
-      if(gaps.some(g=>time>g[0] && time<g[1])) continue;
-      det.push(time,mo.yaw[i]); if(i%20===0) det.update();
+    const mo=K.motion(rec,nc), det=new I.IndoorDetector();
+    // Replay the acquisition transform at original event times. Do not claim that a
+    // regular analysis grid measures the phone's received-event frequency.
+    let lastUpdate=-1;
+    for(let o=0;o<rec.length;o+=nc) {
+      const time=rec[o],lin=rec.slice(o+1,o+4),w=rec.slice(o+7,o+10),g=rec.slice(o+4,o+7),
+        grav=g.map((x,j)=>x-lin[j]),gn=Math.hypot(...grav)||1,up=grav.map(x=>x/gn),
+        gyro=nc<15||rec[o+13]===1,linear=nc<15||rec[o+14]===1,forces=gyro&&linear?K.kartForces(lin,up):null;
+      det.push(time,gyro?K.turnRate(w,up):NaN,forces?forces[1]/9.80665:NaN,forces?forces[0]/9.80665:NaN);
+      if(time-lastUpdate>=0.5){det.update();lastUpdate=time;}
     }
     det.update(true);
     return { version, schema, legacyAxesRepaired:legacy, rejectedRows:rejected, motion:mo, detector:det,
-      gaps, marks, location:loc, laps:det.laps(), duration:t[t.length-1], samples:t.length };
+      gaps, marks, location:loc, laps:det.laps(), duration:t[t.length-1], samples:t.length,
+      recordingHealth:I.recordingHealth(rec,nc),diagnostics:det.diagnostics() };
   }
   function parseCrossings(text) {
     const lines=text.trim().split(/\r?\n/).filter(x=>x.trim() && !x.trim().startsWith('#'));

@@ -236,8 +236,14 @@
       var o = i * nc, t = rec[o], lin = [rec[o + 1], rec[o + 2], rec[o + 3]];
       var gx = rec[o + 4] - lin[0], gy = rec[o + 5] - lin[1], gz = rec[o + 6] - lin[2], gn = Math.sqrt(gx * gx + gy * gy + gz * gz) || 1, up = [gx / gn, gy / gn, gz / gn];
       var f = kartForces(lin, up, c);
-      sy.push(t, turnRate(ws[i], up, c));
-      if (f) { ok++; sa.push(t, f[1]); so.push(t, f[0]); } else { sa.push(t, NaN); so.push(t, NaN); }
+      sy.push(t, nc < 15 || rec[o+13] === 1 ? turnRate(ws[i], up, c) : NaN);
+      if (f && (nc < 15 || rec[o+14] === 1)) { ok++; sa.push(t, f[1]); so.push(t, f[0]); } else { sa.push(t, NaN); so.push(t, NaN); }
+    }
+    if (nc >= 15) {
+      var gyOK = new Uint8Array(sy.v.length), lnOK = new Uint8Array(sa.v.length);
+      for (i=0; i<n; i++) { var base=i*nc, slot=Math.floor(rec[base]*fs); if(slot<gyOK.length && rec[base+13]===1)gyOK[slot]=1; if(slot<lnOK.length && rec[base+14]===1)lnOK[slot]=1; }
+      for(i=0;i<sy.v.length;i++)if(!gyOK[i])sy.v[i]=NaN;
+      for(i=0;i<sa.v.length;i++)if(!lnOK[i]){sa.v[i]=NaN;so.v[i]=NaN;}
     }
     return { yaw: sy.v, lat: sa.v, lon: so.v, axis: c, offSquare: off, found: !!ma, usable: ok / n, rate: rate };
   }
