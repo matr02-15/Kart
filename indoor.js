@@ -8,7 +8,7 @@
       // Lateral G carries a cycle shape, not an angle. Never apply the 360-degree rule to it.
       this.lateral._headingPeriod=()=>null;
       this.active=null;this.channel=null;this.lastTime=null;this.firstTime=null;this.samples=0;this.gyroSamples=0;this.lateralSamples=0;
-      this.lastLateralTime=null;this.deadline=(opts&&opts.learningSeconds)||180;this.final=false;
+      this.lastLateralTime=null;this.deadline=(opts&&opts.learningSeconds)||180;this.final=false;this.clock=0;
       this.recentTimes=[];this.rateBlocked=false;this.minEventRate=15;
       this.qualityGaps=[];this.openQualityGap=null;
       this.lastReason='Collecting several complete motion cycles';
@@ -16,13 +16,14 @@
     push(t,yaw,lat,lon){
       if(!Number.isFinite(t)||t<0||(this.lastTime!==null&&t<=this.lastTime))return false;
       if(this.firstTime===null)this.firstTime=t;
-      this.lastTime=t;this.samples++;if(Number.isFinite(yaw))this.gyroSamples++;
+      this.lastTime=t;this.clock=Math.max(this.clock,t);this.samples++;if(Number.isFinite(yaw))this.gyroSamples++;
       this.recentTimes.push(t);if(this.recentTimes.length>256)this.recentTimes.shift();
       this.yaw.push(t,yaw);
       if(Number.isFinite(lat)){this.lateral.push(t,lat*50);this.lateralSamples++;this.lastLateralTime=t;}
       return true;
     }
-    update(final){
+    update(final,now){
+      if(Number.isFinite(now))this.clock=Math.max(this.clock,now);
       this.final=!!final;
       const recent=this.recentTimes,rate=recent.length>1?(recent.length-1)/(recent[recent.length-1]-recent[0]):null;
       this.rateBlocked=recent.length>=20&&rate<this.minEventRate;
@@ -45,7 +46,12 @@
         'Insufficient distinctive lateral motion':'Whole-lap repetition or timing-point uniqueness not established';
       return false;
     }
-    state(){return this.rateBlocked?'unavailable':this.active?this.active.state():(this.final||(this.lastTime||0)>=this.deadline?'unavailable':'learning');}
+    state(now){
+      if(Number.isFinite(now))this.clock=Math.max(this.clock,now);
+      if(this.clock>=this.deadline && !this.active && this.samples<20)this.lastReason='No usable motion recording before the learning deadline';
+      return this.rateBlocked || (this.lastTime!==null && this.clock-this.lastTime>2) ? 'unavailable' : this.active ? this.active.state() :
+        (this.final || this.clock>=this.deadline ? 'unavailable' : 'learning');
+    }
     diagnostics(){const dt=this.samples>1?(this.lastTime-this.firstTime)/(this.samples-1):null;return {
       state:this.state(),channel:this.channel,reason:this.active&&!this.rateBlocked?'Repeated motion point recognised; accuracy requires independent timing':this.lastReason,
       eventRate:dt?1/dt:null,gyroCoverage:this.samples?this.gyroSamples/this.samples:0,lateralCoverage:this.samples?this.lateralSamples/this.samples:0,

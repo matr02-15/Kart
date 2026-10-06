@@ -1,7 +1,7 @@
 /* app.js -- Apex Trace Kart 2: screens, sensors and storage. The measuring is in core.js. */
 (function () {
   "use strict";
-  const K = window.KartCore, VERSION = "2.4.0", G0 = 9.80665;
+  const K = window.KartCore, VERSION = "2.5.0", G0 = 9.80665;
   const $ = (s, r) => (r || document).querySelector(s), $$ = (s, r) => Array.from((r || document).querySelectorAll(s));
   const esc = s => String(s === null || s === undefined ? "" : s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
   const app = $("#app");
@@ -101,9 +101,9 @@
   /* ------------------------------------------------------------------ recorder */
   const COLS = ["t", "ax", "ay", "az", "gx", "gy", "gz", "rx", "ry", "rz", "yaw", "g", "steer", "gyroValid", "linearValid"];
   class Rec {
-    constructor() { this.nc = COLS.length; this.cap = 60 * 60 * 2; this.buf = new Float32Array(this.cap * this.nc); this.n = 0; }
+    constructor() { this.nc = COLS.length; this.cap = 60 * 60 * 2; this.buf = new Float64Array(this.cap * this.nc); this.n = 0; }
     push(row) {
-      if (this.n === this.cap) { const nb = new Float32Array(this.cap * 2 * this.nc); nb.set(this.buf); this.buf = nb; this.cap *= 2; }
+      if (this.n === this.cap) { const nb = new Float64Array(this.cap * 2 * this.nc); nb.set(this.buf); this.buf = nb; this.cap *= 2; }
       this.buf.set(row, this.n * this.nc); this.n++;
     }
     data() { return this.buf.slice(0, this.n * this.nc); }
@@ -134,7 +134,7 @@
     const t = s.t, laps = currentLaps(s), ok = laps.filter(l => !l.interrupted), last = laps.length ? laps[laps.length - 1] : null, prev = laps.length > 1 ? laps[laps.length - 2] : null;
     const best = ok.length ? ok.reduce((a, b) => b.time < a.time ? b : a) : null, pass = lastPass(s);
     const m = { t, laps, last, prev, best, timing: pass !== null, lapClock: pass !== null ? t - pass : null, delta: null, pred: null, lapN: laps.length + (pass !== null ? 1 : 0),
-                gS: s.gS, gLapMax: s.gLapMax, left: settings.minutes > 0 ? Math.max(0, settings.minutes * 60 - t) : null, source: liveSource(s), standIn: s.source === "auto" && liveSource(s) === "taps", state: s.source === "taps" ? "taps" : s.det.state(),
+                gS: s.gS, gLapMax: s.gLapMax, left: settings.minutes > 0 ? Math.max(0, settings.minutes * 60 - t) : null, source: liveSource(s), standIn: s.source === "auto" && liveSource(s) === "taps", state: s.source === "taps" ? "taps" : s.det.state(t),
                 gps: !!s.gps, gpsOk: !!s.gps && s.gps.healthy(t), gpsAcc: s.gps ? s.gps.acc : null,
                 forceValid: t-s.lastLinearTime<=0.5, forceEver:s.hasLin };
     // live plus or minus to the best lap: follow the best lap's turn pattern from the last pass
@@ -328,10 +328,27 @@
   }
   function stopLocation(s) { try { if (s.locWatch !== null && navigator.geolocation) navigator.geolocation.clearWatch(s.locWatch); } catch (e) { /* gone */ } s.locWatch = null; }
 
+  async function allowMotion() {
+    // Call directly from a button gesture, before starting the session clock.
+    const api = window.DeviceMotionEvent;
+    if (api && typeof api.requestPermission === 'function') {
+      try {
+        if (await api.requestPermission() !== 'granted') {
+          toast('Motion access was refused. Enable motion for this site before automatic recording.', 6000);
+          return false;
+        }
+      } catch (e) {
+        toast('Motion access could not be enabled. Tap Start again or check this site’s permissions.', 6000);
+        return false;
+      }
+    }
+    return true;
+  }
   async function startDrive(sim) {
     if (cur || starting) return;                 // a second tap on "Start" must not start a second session
     starting = true;
     try {
+      if (!sim && !await allowMotion()) return;
       const trk = sim || settings.environment !== "outdoor" ? null : trackById(settings.trackId);
       const s = cur = newSession(trk ? "taps" : settings.source);
       s.t0 = performance.now();
@@ -389,7 +406,7 @@
     ticks++;
     let m = null;
     try {
-      if (ticks % 5 === 0 && s.source === "auto") { const was = s.det.relearned || 0; s.det.update(); if ((s.det.relearned || 0) !== was) note(s, "lap learnt again"); }
+      if (ticks % 5 === 0 && s.source === "auto") { const was = s.det.relearned || 0; s.det.update(false, s.t); if ((s.det.relearned || 0) !== was) note(s, "lap learnt again"); }
       m = model(s);
       if (s.source === "auto" && !s.found && s.det.period !== null) { s.found = true; note(s, "lap found: " + (s.det.period / K.FS).toFixed(1) + " s, by " + s.det.method); }
     } catch (e) {
@@ -409,7 +426,7 @@
     if (m.state === "error" || (s.errAt !== undefined && s.t - s.errAt < 5)) m.status = "Lap timing hit a problem. Still recording.";
     else if (live && !s.gps && s.t > 3 && s.events === 0) m.status = "No motion data from this phone";
     else if (live && !s.gps && s.events > 0 && s.t - (s.tS || 0) > 2) m.status = "Motion data has stopped";
-    else if (live && s.t > 3 && !s.hasGyro && s.source === "auto") m.status = "No turn sensor: tap at the line";
+    else if (live && s.t > 3 && !s.hasGyro && !s.hasLin && s.source === "auto") m.status = "No usable motion sensor: recording continues";
     else if (live && s.t > 2 && s.t < 25 && s.wake !== "held") m.status = "Screen may switch off: battery saver?";
     else if (m.standIn) m.status = "Timing from your taps while the track is learnt";
     else if (m.state === "unavailable") m.status = "Detection unavailable: " + s.det.diagnostics().reason + ". Recording continues.";
@@ -435,7 +452,7 @@
      and at the end. Never throws; the answer says whether the phone's storage took it. */
   async function persist(s, final) {
     let auto = [], taps = [];
-    if (final) { try { s.det.update(true); } catch (e) { s.errs++; note(s, "timing error at the end: " + (e && e.message)); } }
+    if (final) { try { s.det.update(true, s.t); } catch (e) { s.errs++; note(s, "timing error at the end: " + (e && e.message)); } }
     try { auto = s.det.laps(); } catch (e) { auto = []; }
     // taps and GPS say which lap, to a few tenths; the turn pattern around the line then places each pass finely
     let used = s.marks.slice(), sharp = null;
@@ -449,7 +466,7 @@
     meta.sensorSchema = 4; meta.measurementMode = s.environment; meta.recordingHealth = window.KartIndoor.recordingHealth(s.rec.data(), COLS.length); meta.gyroAxes = "xyz: beta,gamma,alpha"; meta.accuracyValidated = false;
     meta.sharp = sharp; if (s.gpsTrack) meta.gps = { track: s.gpsTrack.name, line: s.gpsTrack.line, length: s.gpsTrack.length, marks: s.gpsMarks };
     meta.fallback = fallback; meta.open = !final;                         // open: the session was not stopped (the app was closed, or it is still running)
-    try { meta.detector = { state: s.det.state(), lapLength: s.det.period ? s.det.period / K.FS : null, method: s.det.method, quality: s.det.quality, diagnostics: s.det.diagnostics(), relearned: s.det.relearned || 0 }; } catch (e) { meta.detector = { state: "error" }; }
+    try { meta.detector = { state: s.det.state(s.t), lapLength: s.det.period ? s.det.period / K.FS : null, method: s.det.method, quality: s.det.quality, diagnostics: s.det.diagnostics(), relearned: s.det.relearned || 0 }; } catch (e) { meta.detector = { state: "error" }; }
     const ab = new Uint8Array(s.audio.bins.length * NB); s.audio.bins.forEach((row, i) => ab.set(row, i * NB));
     const data = { id: s.id, rec: s.rec.data(), nc: COLS.length, y20: Float32Array.from(s.det.y), marks: s.marks.slice(), marksUsed: used, autoLaps: auto, tapLaps: taps,
                    audioT: Float32Array.from(s.audio.t), audioBins: ab, nb: NB, loc: s.loc.slice(), sensorSchema: 4 };
@@ -490,7 +507,7 @@
       ${meta.fallback ? `<p class="small" style="margin-top:10px">The automatic timing did not find the lap in this session, so these are the laps from your taps.</p>` : ""}
       ${!meta.nLaps && !meta.demo ? `<p class="small" style="margin-top:10px">No lap was timed. The recording itself is kept: open the session and save the data file.</p>` : ""}
       <button class="go" id="again" type="button" style="margin-top:18px">Start a new session</button>
-      <div class="row" style="margin-top:12px"><button class="btn" id="see" type="button">See this session</button><button class="btn" id="savefile" type="button">Save data file</button><button class="btn" id="home" type="button">All sessions</button></div>
+      <div class="row" style="margin-top:12px"><button class="btn" id="see" type="button">See this session</button><button class="btn" id="savefile" type="button">Save raw recording</button><button class="btn" id="home" type="button">All sessions</button></div>
       <p class="small" style="margin-top:14px">The new session uses the same track name, lap timing and dashboard. Each session is kept separately on this phone.</p></div>`;
     const shown = performance.now(), ready = () => performance.now() - shown > 500;      // not the press that stopped the session
     $("#again").addEventListener("click", () => { if (ready()) startDrive(null); });
@@ -831,7 +848,7 @@
       const rate = st.n / Math.max(0.5, (performance.now() - st.t0) / 1000);
       let persisted = false; try { persisted = navigator.storage && navigator.storage.persisted ? await navigator.storage.persisted() : false; } catch (e) { /* unknown */ }
       $("#checks").innerHTML =
-        li(st.n ? "ok" : "bad", "Motion sensor", st.n ? `Answering ${rate.toFixed(0)} times a second.` : "No answer. This browser or device gives no motion data; lap timing cannot work here.") +
+        li(st.n ? "ok" : "bad", "Motion sensor", st.n ? `Answering ${rate.toFixed(0)} times a second.` : `No motion events received.${window.DeviceMotionEvent && typeof window.DeviceMotionEvent.requestPermission === 'function' ? ' <button class="btn" id="motionallow" type="button">Enable motion</button>' : ' Check device and site permissions.'}`) +
         li(st.gyro ? "ok" : (st.n ? "bad" : ""), "Turn sensor (gyroscope)", st.gyro ? "Present. This is what times your laps and drives the live figure." : "Not found. Without it laps can only be timed by tapping the screen.") +
         li(st.lin ? "ok" : (st.n ? "warn" : ""), "Gravity removed by the phone", st.lin ? "Yes: force readings use the phone's own gravity estimate." : "No: the app estimates gravity itself, force readings are rougher.") +
         li(st.wake === "ok" ? "ok" : (st.wake === "" ? "" : "warn"), "Keeps the screen on", st.wake === "ok" ? "Yes." : st.wake === "" ? "Checking…" : st.wake === "refused" ? "The phone refused. Switch off battery saver, and set the screen timeout to the longest setting before a session." : "Not supported here: set the screen timeout to the longest setting before a session.") +
@@ -840,6 +857,7 @@
         li(navigator.serviceWorker && navigator.serviceWorker.controller ? "ok" : "warn", "Works without a connection", navigator.serviceWorker && navigator.serviceWorker.controller ? "Yes." : "Not yet: reload this page once while connected.") +
         li(persisted ? "ok" : "warn", "Sessions protected from clean-up", persisted ? "Yes." : "The browser may clear saved sessions if the phone runs short of space. Save the data file of sessions you care about.");
       const la = $("#locallow"); if (la) la.onclick = () => navigator.geolocation.getCurrentPosition(() => { st.loc = "granted"; }, e => { if (e && e.code === 1) st.loc = "denied"; }, { enableHighAccuracy: true, timeout: 20000 });
+      const ma = $("#motionallow"); if (ma) ma.onclick = () => allowMotion();
       $("#cyaw").textContent = st.yaw.toFixed(0); $("#cg").textContent = st.g.toFixed(2); $("#chead").textContent = st.head.toFixed(0);
     };
     const timer = setInterval(draw, 500); draw();
@@ -975,6 +993,8 @@
     catch (e) { toast("The file could not be made (" + (e && e.message) + "). The session is still on the phone."); }
   }
   function csvOf(meta, data) {
+    const selected = (meta.source === 'taps' ? data.tapLaps : data.autoLaps) || [];
+    const selectedMarks = window.KartExport.boundaries(selected);
     const nc = data.nc, rec = data.rec, n = rec.length / nc, out = [], sn = meta.sensors || {};
     out.push(`# Apex Trace Kart ${meta.version || VERSION}`, `# Track,${JSON.stringify(meta.track)}`, `# Started,${new Date(meta.started).toISOString()}`, `# Lap timing,${meta.source}`,
       `# ${meta.gps ? "Passes of the line by GPS and taps" : "Taps"} (s),${data.marks.map(x => x.toFixed(3)).join(" ")}`,
@@ -984,6 +1004,8 @@
       `# Phone,${JSON.stringify(navigator.userAgent)}`,
       ...(meta.log || []).map(l => `# Log,${l[0]},${JSON.stringify(l[1])}`),
       `# Sensor schema,${meta.sensorSchema || 2}`,
+      `# Export schema,5`, `# Minimum Apex Trace version,1.5.0`, `# Recording end s,${Math.max(meta.duration || 0,n ? rec[(n-1)*nc] : 0,selectedMarks.length ? selectedMarks[selectedMarks.length-1] : 0)}`,
+      `# Selected boundaries (s),${selectedMarks.map(t=>t.toFixed(9)).join(" ")}`,
       `# Measurement mode,${meta.measurementMode || "indoor"}`,
       `# Recording health,${JSON.stringify(meta.recordingHealth || {})}`,
       `# Detector diagnostics,${JSON.stringify(meta.detector || {})}`,
@@ -1013,7 +1035,7 @@
       <h1>${esc(meta.track)}</h1>
       <p class="sub">${new Date(meta.started).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })}, ${clock(meta.duration)} on track${meta.demo ? ". Simulated data, not a real drive." : ""}${meta.open ? ". This session was not stopped: the app was closed or interrupted, and it is kept as far as it got." : ""}</p>`;
   const footHtml = meta => `<h2>Session data</h2><p class="sub">${sensorText(meta)}</p><p class="sub" id="locline"></p>
-      <div class="row"><button class="btn" id="csv" type="button">Save data file</button><button class="btn" id="lapscsv" type="button">Save lap times</button><button class="btn" id="pcfile" type="button" hidden>Save for Apex Trace on the computer</button>${canShareFiles() ? `<button class="btn" id="share" type="button">Send data file</button>` : ""}<button class="btn" id="rename" type="button">Rename track</button><button class="btn danger" id="del" type="button">Delete session</button></div>
+      <div class="row"><button class="btn" id="csv" type="button">Save raw recording</button><button class="btn" id="lapscsv" type="button">Save lap times</button><button class="btn" id="pcfile" type="button">Export for Apex Trace</button>${canShareFiles() ? `<button class="btn" id="share" type="button">Send for Apex Trace</button>` : ""}<button class="btn" id="rename" type="button">Rename track</button><button class="btn danger" id="del" type="button">Delete session</button></div><p class="small">Import the exported CSV in Apex Trace 1.5.0 or later. Raw recordings are saved separately for diagnosis.</p>
       <div id="confirm"></div>`;
 
   /* Speed and distance of a saved session, worked out from its recording (see estimateSpeed in core.js).
@@ -1070,20 +1092,8 @@
     if(!meta.demo && !(meta.sensorSchema>=3)) {rec=Array.from(rec);for(let o=0;o<rec.length;o+=data.nc){const z=rec[o+7],x=rec[o+8],y=rec[o+9];rec[o+7]=x;rec[o+8]=y;rec[o+9]=z;}}
     return K.motion(rec,data.nc);
   }
-  function indoorPcFile(meta,data,laps) {
-    const mo=indoorMotion(meta,data),out=[],row=a=>out.push(a.map(x=>'"'+String(x).replace(/"/g,'""')+'"').join(','));
-    const marks=laps.length?laps.map(l=>l.start).concat(laps[laps.length-1].end):[];
-    row(['Format','MoTeC CSV File']);row(['Venue',meta.track]);row(['Vehicle','Kart']);row(['Device','Apex Trace Kart '+VERSION+' (phone)']);
-    row(['Measurement mode','indoor']);row(['Accuracy validated','false']);row(['Timing basis',meta.source==='auto'?'virtual motion-pattern point':'recorded physical-line marks']);
-    row(['Sensor schema',meta.sensorSchema||2]);row(['Recording health',JSON.stringify(meta.recordingHealth||{})]);row(['Detector diagnostics',JSON.stringify(meta.detector||{})]);
-    row(['Interval evidence',JSON.stringify(laps)]);
-    row(['Comment','Time-domain indoor motion recording. Speed, position and distance are not supplied as measurements.']);
-    row(['Sample Rate',K.FS]);row(['Beacon Markers',marks.map(x=>x.toFixed(6)).join(' ')]);
-    out.push('','');row(['Time','G Force Lat','G Force Long','Chassis Yaw Rate','Lap Number']);row(['s','G','G','deg/s','']);out.push('','');
-    let lap=0;
-    for(let i=0;i<mo.yaw.length;i++){const t=(i+0.5)/K.FS;while(lap<marks.length&&marks[lap]<=t)lap++;
-      row([t.toFixed(6),Number.isFinite(mo.lat[i])?(mo.lat[i]/G0).toFixed(5):'',Number.isFinite(mo.lon[i])?(mo.lon[i]/G0).toFixed(5):'',Number.isFinite(mo.yaw[i])?mo.yaw[i].toFixed(4):'',lap]);}
-    return out.join('\n')+'\n';
+  function indoorPcFile(meta, data, laps) {
+    return window.KartExport.motionCsv(meta, data, laps);
   }
   async function reviewIndoor(id,opts) {
     const meta=await Store.get('sessions',id),data=await Store.get('data',id);if(!meta||!data){toast('Session data unavailable');return viewHome();}
@@ -1116,7 +1126,7 @@
   }
   /* A file the computer program (Apex Trace) reads: time, speed, forces, turn rate and lap markers at 20 a second. */
   function pcFile(meta, data, laps, sp) {
-    if (meta.measurementMode !== "outdoor") return indoorPcFile(meta, data, laps);
+    if (meta.measurementMode !== "outdoor" || !sp || !sp.v) return indoorPcFile(meta, data, laps);
     const mo = sp.mo, n = Math.min(sp.v.length, mo.yaw.length), fs = sp.fs, out = [], q = x => '"' + String(x).replace(/"/g, "'") + '"', d = new Date(meta.started), pad = x => String(x).padStart(2, "0");
     const marks = laps.length ? laps.map(l => l.start).concat([laps[laps.length - 1].end]) : [];
     const row = a => out.push(a.map(q).join(","));
@@ -1276,12 +1286,12 @@
       ll.textContent = `Location from the phone: ${loc.length} fix${loc.length === 1 ? "" : "es"}, one every ${(meta.duration / loc.length).toFixed(1)} s on average` + (acc.length ? `, accuracy claimed ${acc[acc.length >> 1].toFixed(0)} m typically (best ${acc[0].toFixed(0)} m)` : "") + (withSpeed ? `, ${withSpeed} with a GPS speed.` : ", none with a GPS speed.") + (acc.length && acc[acc.length >> 1] > 8 ? " Too coarse to place the kart on the track." : "");
     } else if (ll) ll.textContent = meta.demo ? "" : "No location was received from the phone during this session.";
     const pc = $("#pcfile");
-    if (pc && sp) { pc.hidden = false; pc.addEventListener("click", () => { try { download(fileBase(meta) + "_for_ApexTrace.csv", pcFile(Object.assign({},meta,{source}), data, laps, sp)); toast("Saved to the phone's Downloads folder."); } catch (e) { toast("The file could not be made (" + (e && e.message) + ")."); } }); }
+    if (pc) { pc.hidden = false; pc.addEventListener("click", () => { try { download(fileBase(meta) + "_for_ApexTrace.csv", pcFile(Object.assign({},meta,{source}), data, laps, sp)); toast("Exported for Apex Trace 1.5.0 or later."); } catch (e) { toast("The file could not be made (" + (e && e.message) + ")."); } }); }
     $("#back").addEventListener("click", viewHome);
     $("#again").addEventListener("click", () => startDrive(null));
     const base = fileBase(meta);
-    $("#csv").addEventListener("click", () => saveDataFile(meta, data));
-    const sh = $("#share"); if (sh) sh.addEventListener("click", () => shareFile(base + ".csv", csvOf(meta, data)));
+    $("#csv").addEventListener("click", () => saveDataFile(Object.assign({}, meta, {source}), data));
+    const sh = $("#share"); if (sh) sh.addEventListener("click", () => shareFile(base + "_for_ApexTrace.csv", pcFile(Object.assign({}, meta, {source}), data, laps, sp)));
     $("#lapscsv").addEventListener("click", () => download(base + "_laps.csv", "lap,time_s,start_s,end_s,timed_by,interrupted\n" + laps.map(l => [l.n, l.time.toFixed(3), l.start.toFixed(3), l.end.toFixed(3), source === "taps" && meta.gps && meta.gps.marks ? "gps" : source, l.interrupted ? "yes" : "no"].join(",")).join("\n") + "\n"));
     $("#rename").addEventListener("click", () => {
       $("#confirm").innerHTML = `<div class="field"><label for="newname">Track name</label><input type="text" id="newname" value="${esc(meta.track)}" maxlength="40"></div><div class="row"><button class="btn primary" id="oknm" type="button">Save name</button></div>`;
